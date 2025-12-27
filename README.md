@@ -1,1 +1,1 @@
-# FTDI-USB-Sensor-Test
+# FTDI-USB-Sensor-Interface
