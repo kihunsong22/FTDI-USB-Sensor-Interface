@@ -101,7 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!();
 
                 // Accelerometer display
-                println!("ACCELEROMETER (g)                    -2g ◄─────────┼─────────► +2g");
+                println!("ACCELEROMETER (g)  [-2g ◄─────────────────┼─────────────────► +2g]");
                 println!("  X: {:7.3}g  [{}]", ax, create_bar(ax, 2.0, 40));
                 println!("  Y: {:7.3}g  [{}]", ay, create_bar(ay, 2.0, 40));
                 println!("  Z: {:7.3}g  [{}]", az, create_bar(az, 2.0, 40));
@@ -109,7 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!();
 
                 // Gyroscope display
-                println!("GYROSCOPE (°/s)                   -250°/s ◄───────┼───────► +250°/s");
+                println!("GYROSCOPE (°/s)  [-250°/s ◄──────────────┼──────────────► +250°/s]");
                 println!("  X: {:7.2}°/s [{}]", gx, create_bar(gx, 250.0, 40));
                 println!("  Y: {:7.2}°/s [{}]", gy, create_bar(gy, 250.0, 40));
                 println!("  Z: {:7.2}°/s [{}]", gz, create_bar(gz, 250.0, 40));
