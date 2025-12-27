@@ -37,6 +37,18 @@ pub enum Mpu6050Error {
     /// Invalid parameter
     #[error("Invalid parameter: {0}")]
     InvalidParameter(String),
+
+    /// FIFO overflow error
+    #[error("FIFO overflow: data loss occurred, samples lost estimate: {samples_lost}")]
+    FifoOverflow { samples_lost: String },
+
+    /// FIFO not enabled
+    #[error("FIFO is not enabled. Call enable_fifo() first.")]
+    FifoNotEnabled,
+
+    /// Invalid FIFO configuration
+    #[error("Invalid FIFO configuration: {0}")]
+    InvalidFifoConfig(String),
 }
 
 impl From<FT_STATUS> for Mpu6050Error {
