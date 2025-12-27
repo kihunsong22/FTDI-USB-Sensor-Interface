@@ -11,6 +11,8 @@ const MPU6050_ADDRESS: u8 = 0x68; // Default I2C address
 // MPU6050 Register addresses
 const REG_WHO_AM_I: u8 = 0x75;
 const REG_PWR_MGMT_1: u8 = 0x6B;
+const REG_PWR_MGMT_2: u8 = 0x6C;
+const REG_SIGNAL_PATH_RESET: u8 = 0x68;
 const REG_ACCEL_CONFIG: u8 = 0x1C;
 const REG_GYRO_CONFIG: u8 = 0x1B;
 const REG_ACCEL_XOUT_H: u8 = 0x3B;
@@ -200,6 +202,10 @@ impl Mpu6050 {
 
         // Small delay for sensor to wake up
         std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Disable FIFO and reset it (clear any residual data)
+        self.write_register(REG_USER_CTRL, 0x00)?;
+        self.write_register(REG_FIFO_EN, 0x00)?;
 
         // Verify device ID
         let who_am_i = self.read_register(REG_WHO_AM_I)?;
@@ -663,6 +669,16 @@ impl Mpu6050 {
             self.disable_fifo()?;
         }
 
+        // Ensure FIFO is completely disabled
+        self.write_register(REG_USER_CTRL, 0x00)?;
+        self.write_register(REG_FIFO_EN, 0x00)?;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Reset signal paths (accel, gyro, temp) - ensures clean FIFO operation
+        self.write_register(REG_SIGNAL_PATH_RESET, 0x07)?;  // Reset all signal paths
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Configure sample rate FIRST (before enabling FIFO)
         // Configure DLPF for 1kHz gyro output rate (DLPF_CFG=1, 188Hz BW)
         self.write_register(REG_CONFIG, 0x01)?;
 
@@ -673,17 +689,19 @@ impl Mpu6050 {
         let divider = (gyro_rate / sample_rate_hz).saturating_sub(1);
         self.write_register(REG_SMPLRT_DIV, divider as u8)?;
 
-        // Reset FIFO
-        self.write_register(REG_USER_CTRL, USER_CTRL_FIFO_RESET)?;
-        std::thread::sleep(std::time::Duration::from_millis(10));
-
-        // Enable accelerometer and gyroscope data to FIFO
+        // Enable sensors to FIFO (but FIFO itself still disabled)
         self.write_register(REG_FIFO_EN, FIFO_EN_ALL_SENSORS)?;
 
-        // Enable FIFO
+        // Now enable FIFO - this clears it (toggling FIFO_EN is the reliable clear method)
         self.write_register(REG_USER_CTRL, USER_CTRL_FIFO_EN)?;
 
         self.fifo_enabled = true;
+
+        // Wait a bit then read and discard any startup artifacts
+        // (FIFO may accumulate some samples during enable sequence)
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let _ = self.read_fifo_batch();  // Ignore result, just clear FIFO
+
         Ok(())
     }
 
@@ -706,6 +724,19 @@ impl Mpu6050 {
 
         self.fifo_enabled = false;
         Ok(())
+    }
+
+    /// Read FIFO configuration registers for debugging
+    ///
+    /// Returns (PWR_MGMT_1, PWR_MGMT_2, CONFIG, SMPLRT_DIV, FIFO_EN, USER_CTRL)
+    pub fn read_fifo_config(&mut self) -> Result<(u8, u8, u8, u8, u8, u8)> {
+        let pwr_mgmt_1 = self.read_register(REG_PWR_MGMT_1)?;
+        let pwr_mgmt_2 = self.read_register(REG_PWR_MGMT_2)?;
+        let config = self.read_register(REG_CONFIG)?;
+        let smplrt_div = self.read_register(REG_SMPLRT_DIV)?;
+        let fifo_en = self.read_register(REG_FIFO_EN)?;
+        let user_ctrl = self.read_register(REG_USER_CTRL)?;
+        Ok((pwr_mgmt_1, pwr_mgmt_2, config, smplrt_div, fifo_en, user_ctrl))
     }
 
     /// Get the current number of bytes in the FIFO buffer
@@ -781,20 +812,7 @@ impl Mpu6050 {
             return Err(Mpu6050Error::FifoNotEnabled);
         }
 
-        // Check for overflow first
-        if self.check_fifo_overflow()? {
-            let count = self.read_fifo_count_raw()?;
-            let samples_lost = count / FIFO_SAMPLE_SIZE as u16;
-
-            // Reset FIFO to recover
-            self.reset_fifo()?;
-
-            return Err(Mpu6050Error::FifoOverflow {
-                samples_lost: format!("~{}", samples_lost),
-            });
-        }
-
-        // Read FIFO count
+        // Read FIFO count FIRST (even if overflow occurred, there's still valid data)
         let fifo_count = self.read_fifo_count_raw()?;
 
         if fifo_count == 0 {
@@ -811,6 +829,10 @@ impl Mpu6050 {
 
         // Read FIFO data
         let fifo_data = self.read_fifo_raw(bytes_to_read)?;
+
+        // Check for overflow AFTER reading (overflow means some data was lost, but what we read is valid)
+        // Reading INT_STATUS clears the overflow flag, no need to reset FIFO
+        let _ = self.read_register(REG_INT_STATUS)?;
 
         // Parse into SensorData structs
         Self::parse_fifo_data(&fifo_data)

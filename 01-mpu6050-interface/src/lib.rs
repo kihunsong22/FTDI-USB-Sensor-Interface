@@ -73,25 +73,25 @@
 //! # Ok::<(), ft232_sensor_interface::Mpu6050Error>(())
 //! ```
 //!
-//! ## High-Speed FIFO Mode (up to 1kHz)
+//! ## High-Speed FIFO Mode (~850 Hz)
 //!
 //! For applications requiring higher sample rates (vibration analysis, frequency
-//! analysis), the MPU6050's FIFO buffer allows 1kHz internal sampling with
-//! periodic batch reads.
+//! analysis), the MPU6050's FIFO buffer allows high-speed internal sampling with
+//! periodic batch reads. Actual sample rate is ~850 Hz due to hardware clock tolerance.
 //!
 //! ```no_run
 //! use ft232_sensor_interface::Mpu6050;
 //!
 //! let mut sensor = Mpu6050::new(0)?;
 //!
-//! // Enable FIFO mode for 1kHz internal sampling
+//! // Enable FIFO mode for high-speed sampling (~850 Hz actual)
 //! sensor.enable_fifo(1000)?;
 //!
 //! // Collect 2048 samples for FFT analysis
 //! let samples = sensor.collect_samples_fifo(1000, 2048)?;
 //!
-//! // Or stream FIFO batches with callback (50ms intervals, ~50 samples/batch)
-//! sensor.stream_fifo(50, |batch| {
+//! // Or stream FIFO batches with callback (20ms intervals, ~17 samples/batch)
+//! sensor.stream_fifo(20, |batch| {
 //!     println!("Received {} samples", batch.len());
 //!     // Process batch...
 //!     ft232_sensor_interface::StreamControl::Continue
@@ -99,9 +99,9 @@
 //! # Ok::<(), ft232_sensor_interface::Mpu6050Error>(())
 //! ```
 //!
-//! **Note**: FIFO mode provides buffered high-speed sampling. Samples are read
-//! in batches every 50ms with ~50-55ms latency. Use direct `stream()` for
-//! real-time applications requiring immediate response.
+//! **Note**: FIFO mode provides buffered high-speed sampling (~2.5x faster than
+//! direct polling). Samples are read in batches with 20-50ms latency. Use direct
+//! `stream()` for real-time applications requiring immediate response.
 
 pub mod error;
 mod ffi;
