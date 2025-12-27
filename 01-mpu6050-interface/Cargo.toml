@@ -1,0 +1,17 @@
+[package]
+name = "ft232-sensor-interface"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "ft232_sensor_interface"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mpu6050-reader"
+path = "src/main.rs"
+
+[dependencies]
+thiserror = "1.0"
+
+[build-dependencies]

@@ -1,0 +1,6 @@
+# Cargo configuration for FT232 Sensor Interface
+# Library paths are handled by build.rs
+
+[build]
+# Target Windows x86 (32-bit) to match available DLLs
+target = "i686-pc-windows-msvc"
