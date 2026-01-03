@@ -2,6 +2,7 @@
 name = "ft232-sensor-interface"
 version = "0.1.0"
 edition = "2021"
+default-run = "mpu6050-reader"
 
 [lib]
 name = "ft232_sensor_interface"
@@ -11,7 +12,40 @@ path = "src/lib.rs"
 name = "mpu6050-reader"
 path = "src/main.rs"
 
+[[bin]]
+name = "collector"
+path = "src/bin/collector.rs"
+
+[[bin]]
+name = "analyzer"
+path = "src/bin/analyzer.rs"
+required-features = ["analysis"]
+
+[[bin]]
+name = "sensor-gui"
+path = "src/bin/sensor_gui/main.rs"
+required-features = ["gui"]
+
 [dependencies]
 thiserror = "1.0"
+# Use git version for HDF5 1.14.x support
+hdf5 = { git = "https://github.com/aldanor/hdf5-rust.git" }
+chrono = "0.4"
+clap = { version = "4.4", features = ["derive"] }
+ctrlc = "3.4"
+
+# Analysis dependencies (feature-gated)
+rustfft = { version = "6.1", optional = true }
+num-complex = { version = "0.4", optional = true }
+
+# GUI dependencies (feature-gated)
+eframe = { version = "0.29", optional = true }
+egui = { version = "0.29", optional = true }
+egui_plot = { version = "0.29", optional = true }
+rfd = { version = "0.15", optional = true }
+
+[features]
+analysis = ["rustfft", "num-complex"]
+gui = ["eframe", "egui", "egui_plot", "rfd", "analysis"]
 
 [build-dependencies]

@@ -106,7 +106,11 @@
 pub mod error;
 mod ffi;
 pub mod mpu6050;
+pub mod hdf5_format;
+pub mod common;
 
 // Re-export public API
 pub use error::{Mpu6050Error, Result};
 pub use mpu6050::{Mpu6050, SensorData, StreamControl};
+pub use hdf5_format::{Hdf5Reader, Hdf5Writer, Metadata, TimestampedSample};
+pub use common::{TimeKeeper, create_bar};
