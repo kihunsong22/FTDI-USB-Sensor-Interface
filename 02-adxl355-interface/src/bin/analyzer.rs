@@ -3,7 +3,7 @@
 //! Post-processing analysis tool for sensor data from HDF5 files.
 
 use clap::Parser;
-use ft232_adxl355_interface::{Hdf5Reader, TimestampedSample};
+use ft232_adxl355_interface::{Hdf5Reader, Range, TimestampedSample};
 use num_complex::Complex;
 use rustfft::FftPlanner;
 use std::f64::consts::PI;
@@ -53,6 +53,12 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let reader = Hdf5Reader::open(&args.input)?;
     let metadata = reader.metadata();
+
+    let range = match metadata.range.as_str() {
+        "4g" => Range::G4,
+        "8g" => Range::G8,
+        _ => Range::G2,
+    };
 
     let run_statistics = args.all || args.statistics;
     let run_fft = args.all || args.fft;
@@ -123,21 +129,21 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         writeln!(output, "\n{}", "=".repeat(80))?;
         writeln!(output, "STATISTICAL ANALYSIS")?;
         writeln!(output, "{}", "=".repeat(80))?;
-        run_statistics_analysis(&mut output, &samples)?;
+        run_statistics_analysis(&mut output, &samples, range)?;
     }
 
     if run_fft {
         writeln!(output, "\n{}", "=".repeat(80))?;
         writeln!(output, "FREQUENCY ANALYSIS (FFT)")?;
         writeln!(output, "{}", "=".repeat(80))?;
-        run_fft_analysis(&mut output, &samples, metadata.sample_rate_hz)?;
+        run_fft_analysis(&mut output, &samples, metadata.sample_rate_hz, range)?;
     }
 
     if run_vibration {
         writeln!(output, "\n{}", "=".repeat(80))?;
         writeln!(output, "VIBRATION ANALYSIS")?;
         writeln!(output, "{}", "=".repeat(80))?;
-        run_vibration_analysis(&mut output, &samples, metadata.sample_rate_hz)?;
+        run_vibration_analysis(&mut output, &samples, metadata.sample_rate_hz, range)?;
     }
 
     writeln!(output, "\n{}", "=".repeat(80))?;
@@ -172,10 +178,10 @@ fn compute_stats(data: &[f32]) -> Stats {
     Stats { mean, rms, std_dev, min, max, peak_to_peak }
 }
 
-fn run_statistics_analysis(output: &mut dyn Write, samples: &[TimestampedSample]) -> io::Result<()> {
-    let accel_x: Vec<f32> = samples.iter().map(|s| s.data.accel_x_g()).collect();
-    let accel_y: Vec<f32> = samples.iter().map(|s| s.data.accel_y_g()).collect();
-    let accel_z: Vec<f32> = samples.iter().map(|s| s.data.accel_z_g()).collect();
+fn run_statistics_analysis(output: &mut dyn Write, samples: &[TimestampedSample], range: Range) -> io::Result<()> {
+    let accel_x: Vec<f32> = samples.iter().map(|s| s.data.accel_to_g(range).0).collect();
+    let accel_y: Vec<f32> = samples.iter().map(|s| s.data.accel_to_g(range).1).collect();
+    let accel_z: Vec<f32> = samples.iter().map(|s| s.data.accel_to_g(range).2).collect();
 
     let stats_ax = compute_stats(&accel_x);
     let stats_ay = compute_stats(&accel_y);
@@ -254,7 +260,7 @@ fn analyze_frequencies(data: &[f32], sample_rate: f64, window_size: usize) -> Ve
     peaks
 }
 
-fn run_fft_analysis(output: &mut dyn Write, samples: &[TimestampedSample], sample_rate: f64) -> io::Result<()> {
+fn run_fft_analysis(output: &mut dyn Write, samples: &[TimestampedSample], sample_rate: f64, range: Range) -> io::Result<()> {
     const WINDOW_SIZE: usize = 2048;
 
     writeln!(output)?;
@@ -271,9 +277,9 @@ fn run_fft_analysis(output: &mut dyn Write, samples: &[TimestampedSample], sampl
         return Ok(());
     }
 
-    let accel_x: Vec<f32> = samples.iter().map(|s| s.data.accel_x_g()).collect();
-    let accel_y: Vec<f32> = samples.iter().map(|s| s.data.accel_y_g()).collect();
-    let accel_z: Vec<f32> = samples.iter().map(|s| s.data.accel_z_g()).collect();
+    let accel_x: Vec<f32> = samples.iter().map(|s| s.data.accel_to_g(range).0).collect();
+    let accel_y: Vec<f32> = samples.iter().map(|s| s.data.accel_to_g(range).1).collect();
+    let accel_z: Vec<f32> = samples.iter().map(|s| s.data.accel_to_g(range).2).collect();
 
     writeln!(output, "Accelerometer Frequency Analysis:")?;
     writeln!(output, "{:-<80}", "")?;
@@ -337,7 +343,7 @@ fn integrate_trapezoidal(data: &[f32], dt: f64) -> Vec<f32> {
     integrated
 }
 
-fn run_vibration_analysis(output: &mut dyn Write, samples: &[TimestampedSample], sample_rate: f64) -> io::Result<()> {
+fn run_vibration_analysis(output: &mut dyn Write, samples: &[TimestampedSample], sample_rate: f64, range: Range) -> io::Result<()> {
     let dt = 1.0 / sample_rate;
 
     writeln!(output)?;
@@ -347,9 +353,9 @@ fn run_vibration_analysis(output: &mut dyn Write, samples: &[TimestampedSample],
     writeln!(output, "  High-pass filter cutoff: 0.5 Hz")?;
     writeln!(output)?;
 
-    let accel_x: Vec<f32> = samples.iter().map(|s| s.data.accel_x_g()).collect();
-    let accel_y: Vec<f32> = samples.iter().map(|s| s.data.accel_y_g()).collect();
-    let accel_z: Vec<f32> = samples.iter().map(|s| s.data.accel_z_g()).collect();
+    let accel_x: Vec<f32> = samples.iter().map(|s| s.data.accel_to_g(range).0).collect();
+    let accel_y: Vec<f32> = samples.iter().map(|s| s.data.accel_to_g(range).1).collect();
+    let accel_z: Vec<f32> = samples.iter().map(|s| s.data.accel_to_g(range).2).collect();
 
     // RMS acceleration
     let rms_x = compute_rms(&accel_x);

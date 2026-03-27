@@ -77,11 +77,16 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("Sensor initialized!\n");
 
     println!("Creating HDF5 file...");
+    let range_str = match sensor.get_range() {
+        ft232_adxl355_interface::Range::G2 => "2g",
+        ft232_adxl355_interface::Range::G4 => "4g",
+        ft232_adxl355_interface::Range::G8 => "8g",
+    };
     let mut writer = Hdf5Writer::create(
         &args.output,
         &args.mode,
         actual_rate,
-        "2g",
+        range_str,
     )?;
     println!("HDF5 file created!\n");
 

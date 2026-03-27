@@ -18,13 +18,14 @@ const REG_PARTID: u8 = 0x02;      // Part ID (expect 0xED for ADXL355)
 const REG_REVID: u8 = 0x03;       // Silicon revision
 
 // Status and FIFO
+#[allow(dead_code)]
 const REG_STATUS: u8 = 0x04;      // Status register
 const REG_FIFO_ENTRIES: u8 = 0x05; // Number of valid FIFO samples (0-96)
 
-// Temperature data (12-bit)
-const REG_TEMP2: u8 = 0x06;       // Temperature bits [11:4]
+// Temperature data (12-bit: TEMP2[3:0] = bits[11:8], TEMP1[7:0] = bits[7:0])
+const REG_TEMP2: u8 = 0x06;       // Temperature bits [11:8] in lower nibble
 #[allow(dead_code)]
-const REG_TEMP1: u8 = 0x07;       // Temperature bits [3:0] in upper nibble
+const REG_TEMP1: u8 = 0x07;       // Temperature bits [7:0]
 
 // Accelerometer data (20-bit per axis, 3 registers each)
 const REG_XDATA3: u8 = 0x08;      // X-axis [19:12]
@@ -63,6 +64,7 @@ const PARTID_VALUE: u8 = 0xED;    // ADXL355
 const STATUS_DATA_RDY: u8 = 0x01;     // Data ready
 #[allow(dead_code)]
 const STATUS_FIFO_FULL: u8 = 0x02;    // FIFO full
+#[allow(dead_code)]
 const STATUS_FIFO_OVR: u8 = 0x04;     // FIFO overrun
 
 // Power control bits
@@ -72,7 +74,8 @@ const POWER_CTL_STANDBY: u8 = 0x01;   // Standby mode
 const RESET_CODE: u8 = 0x52;
 
 // FIFO constants
-const FIFO_SAMPLE_SIZE: usize = 9;    // 3 bytes per axis * 3 axes (no temperature)
+#[allow(dead_code)]
+const FIFO_SAMPLE_SIZE: usize = 9;    // 3 bytes per axis × 3 axes (no temperature)
 #[allow(dead_code)]
 const FIFO_MAX_SAMPLES: usize = 96;   // Maximum FIFO depth
 
@@ -177,27 +180,12 @@ impl SensorData {
         )
     }
 
-    /// Get accelerometer X-axis in g (default +/-2g range)
-    pub fn accel_x_g(&self) -> f32 {
-        self.accel_x as f32 / 256_000.0
-    }
-
-    /// Get accelerometer Y-axis in g (default +/-2g range)
-    pub fn accel_y_g(&self) -> f32 {
-        self.accel_y as f32 / 256_000.0
-    }
-
-    /// Get accelerometer Z-axis in g (default +/-2g range)
-    pub fn accel_z_g(&self) -> f32 {
-        self.accel_z as f32 / 256_000.0
-    }
-
     /// Convert raw temperature to Celsius
     ///
     /// Note: The temperature sensor is uncalibrated (~10% tolerance on slope).
     /// Useful for drift compensation, not absolute measurement.
     pub fn temperature_c(&self) -> f32 {
-        ((self.temperature as f32 - 1852.0) / -9.05) + 25.0
+        ((self.temperature as f32 - 1885.0) / -9.05) + 25.0
     }
 }
 
@@ -229,7 +217,7 @@ impl Adxl355 {
     /// Tries 0x1D first, then 0x53. Use `with_address()` to skip detection.
     pub fn new(channel_index: u32) -> Result<Self> {
         // Open channel first, then probe both addresses
-        let (handle, _) = Self::open_channel(channel_index)?;
+        let handle = Self::open_channel(channel_index)?;
 
         for &address in &[ADXL355_ADDRESS_LOW, ADXL355_ADDRESS_HIGH] {
             let mut sensor = Adxl355 {
@@ -241,7 +229,6 @@ impl Adxl355 {
 
             match sensor.init() {
                 Ok(()) => {
-                    println!("ADXL355 found at address 0x{:02X}", address);
                     return Ok(sensor);
                 }
                 Err(_) => {
@@ -270,7 +257,7 @@ impl Adxl355 {
             )));
         }
 
-        let (handle, _) = Self::open_channel(channel_index)?;
+        let handle = Self::open_channel(channel_index)?;
 
         let mut sensor = Adxl355 {
             handle,
@@ -285,7 +272,7 @@ impl Adxl355 {
     }
 
     /// Open and configure an I2C channel
-    fn open_channel(channel_index: u32) -> Result<(FT_HANDLE, ())> {
+    fn open_channel(channel_index: u32) -> Result<FT_HANDLE> {
         let mut num_channels: DWORD = 0;
         let status = unsafe { I2C_GetNumChannels(&mut num_channels) };
         if status != FT_OK {
@@ -307,7 +294,7 @@ impl Adxl355 {
         }
 
         let mut config = ChannelConfig {
-            ClockRate: I2C_CLOCK_FAST_MODE_PLUS,
+            ClockRate: I2C_CLOCK_FAST_MODE_PLUS, // 1 MHz (3.4 MHz fails on breadboard)
             LatencyTimer: 1,
             Options: 0,
             Pin: 0,
@@ -320,7 +307,7 @@ impl Adxl355 {
             return Err(status.into());
         }
 
-        Ok((handle, ()))
+        Ok(handle)
     }
 
     /// Initialize the ADXL355 sensor
@@ -550,7 +537,7 @@ impl Adxl355 {
     /// Read temperature (12-bit raw value)
     pub fn read_temperature(&mut self) -> Result<u16> {
         let data = self.read_registers(REG_TEMP2, 2)?;
-        let temp = ((data[0] as u16) << 8) | (data[1] as u16);
+        let temp = ((data[0] as u16 & 0x0F) << 8) | (data[1] as u16);
         Ok(temp)
     }
 
@@ -700,35 +687,45 @@ impl Adxl355 {
 
     /// Read all available samples from the FIFO
     ///
-    /// FIFO_ENTRIES reports axis entries (not complete XYZ samples).
-    /// Each entry is 3 bytes (one axis). A complete sample = 3 entries (X, Y, Z).
-    /// Burst read from FIFO_DATA (0x11) auto-pops data without incrementing.
+    /// Reads FIFO_ENTRIES to determine count, then burst reads exact bytes needed.
+    /// Uses X-axis marker bit (bit 0) for alignment (datasheet Rev. D, p31).
     pub fn read_fifo_batch(&mut self) -> Result<Vec<SensorData>> {
         let entries = self.get_fifo_entries()? as usize;
 
-        if entries == 0 {
+        if entries < 3 {
             return Ok(Vec::new());
         }
 
-        // FIFO_ENTRIES reports axis entries, not complete XYZ samples.
-        // Each entry is 3 bytes (one axis). A complete sample = 3 entries.
+        // FIFO_ENTRIES reports axis locations. Round down to complete XYZ sets.
         let num_samples = entries / 3;
-        if num_samples == 0 {
-            return Ok(Vec::new());
-        }
-        let bytes_to_read = num_samples * 9; // 3 axes × 3 bytes each
+        let bytes_to_read = num_samples * 9;
 
-        // Burst read all FIFO data (register 0x11 auto-pops, does not auto-increment)
         let fifo_data = self.read_registers(REG_FIFO_DATA, bytes_to_read)?;
 
-        // Parse: every 9 bytes = one XYZ sample (3 bytes per axis)
+        // Parse with X-axis marker alignment (bit 0 of low byte = X marker)
         let mut samples = Vec::with_capacity(num_samples);
-        for i in 0..num_samples {
-            let offset = i * 9;
+        let mut i = 0;
 
-            let accel_x = parse_20bit(fifo_data[offset], fifo_data[offset + 1], fifo_data[offset + 2]);
-            let accel_y = parse_20bit(fifo_data[offset + 3], fifo_data[offset + 4], fifo_data[offset + 5]);
-            let accel_z = parse_20bit(fifo_data[offset + 6], fifo_data[offset + 7], fifo_data[offset + 8]);
+        // Find first X-axis entry for alignment
+        while i + 2 < fifo_data.len() {
+            if fifo_data[i + 2] & 0x02 != 0 {
+                return Ok(samples); // Empty
+            }
+            if fifo_data[i + 2] & 0x01 != 0 {
+                break; // X-axis found
+            }
+            i += 3; // Skip misaligned entry
+        }
+
+        // Parse aligned XYZ triplets
+        while i + 8 < fifo_data.len() {
+            if fifo_data[i + 2] & 0x02 != 0 {
+                break;
+            }
+
+            let accel_x = parse_20bit(fifo_data[i], fifo_data[i + 1], fifo_data[i + 2]);
+            let accel_y = parse_20bit(fifo_data[i + 3], fifo_data[i + 4], fifo_data[i + 5]);
+            let accel_z = parse_20bit(fifo_data[i + 6], fifo_data[i + 7], fifo_data[i + 8]);
 
             samples.push(SensorData {
                 accel_x,
@@ -736,6 +733,8 @@ impl Adxl355 {
                 accel_z,
                 temperature: 0,
             });
+
+            i += 9;
         }
 
         Ok(samples)

@@ -1,10 +1,12 @@
 //! ADXL355 sensor reader - Continuous data acquisition and display
 //!
-//! Uses FIFO mode for high-speed sampling (1kHz+).
+//! Uses FIFO mode for high-speed sampling (~700 Hz over I2C, 4kHz+ with SPI).
 //! Display updates at ~120 Hz, decoupled from read rate.
 
 use ft232_adxl355_interface::{Adxl355, Adxl355Error, OutputDataRate, create_bar};
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -30,6 +32,13 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let range = sensor.get_range();
     let odr = OutputDataRate::Odr4000;
 
+    // Ctrl+C handler
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+    })?;
+
     println!("Enabling FIFO mode at {} Hz...", odr.as_hz());
     sensor.enable_fifo(odr)?;
     println!("FIFO enabled! Press Ctrl+C to exit\n");
@@ -48,7 +57,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let display_interval = Duration::from_millis(8); // ~120 Hz display
     let mut next_display = Instant::now() + display_interval;
 
-    loop {
+    while running.load(Ordering::SeqCst) {
         // Read FIFO — fast, no display overhead
         match sensor.read_fifo_batch() {
             Ok(batch) if !batch.is_empty() => {
@@ -78,11 +87,21 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 0.0
             };
 
+            // Read temperature once per display update (not in FIFO)
+            let temp_str = match sensor.read_temperature() {
+                Ok(raw) => {
+                    let temp_c = ((raw as f32 - 1885.0) / -9.05) + 25.0;
+                    format!("{:.1}°C", temp_c)
+                }
+                Err(_) => "N/A".to_string(),
+            };
+
             print!("\x1B[H");
             println!("ADXL355 Sensor Reader - FIFO Mode ({} Hz ODR)                   ", odr.as_hz());
             println!("==================================                              ");
             println!("Time: {:.2}s | Samples: {} | Rate: {:.1} Hz | Batch: {}         ",
                 elapsed, total_samples, sample_rate, last_batch_size);
+            println!("Temperature: {}                                                  ", temp_str);
             println!();
             println!("ACCELEROMETER (g)  [-2g ◄─────────────────┼─────────────────► +2g]");
             println!("  X: {:8.5}g  [{}]", last_ax, create_bar(last_ax, 2.0, 40));
@@ -93,4 +112,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             let _ = io::stdout().flush();
         }
     }
+
+    println!("\nShutting down...");
+    Ok(())
 }
