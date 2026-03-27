@@ -224,16 +224,44 @@ pub struct Adxl355 {
 }
 
 impl Adxl355 {
-    /// Create a new ADXL355 instance with default I2C address (0x1D)
+    /// Create a new ADXL355 instance, auto-detecting the I2C address
+    ///
+    /// Tries 0x1D first, then 0x53. Use `with_address()` to skip detection.
     pub fn new(channel_index: u32) -> Result<Self> {
-        Self::with_address(channel_index, ADXL355_ADDRESS_LOW)
+        // Open channel first, then probe both addresses
+        let (handle, _) = Self::open_channel(channel_index)?;
+
+        for &address in &[ADXL355_ADDRESS_LOW, ADXL355_ADDRESS_HIGH] {
+            let mut sensor = Adxl355 {
+                handle,
+                address,
+                range: Range::G2,
+                fifo_enabled: false,
+            };
+
+            match sensor.init() {
+                Ok(()) => {
+                    println!("ADXL355 found at address 0x{:02X}", address);
+                    return Ok(sensor);
+                }
+                Err(_) => {
+                    // Reset state for next attempt
+                    sensor.fifo_enabled = false;
+                    // Prevent Drop from closing the handle — we'll reuse it
+                    std::mem::forget(sensor);
+                    continue;
+                }
+            }
+        }
+
+        // Neither address worked — close the channel and report
+        unsafe { I2C_CloseChannel(handle) };
+        Err(Adxl355Error::CommunicationError(
+            "ADXL355 not found at 0x1D or 0x53. Check wiring and VDDIO.".to_string()
+        ))
     }
 
     /// Create a new ADXL355 instance with a specific I2C address
-    ///
-    /// # Arguments
-    /// * `channel_index` - Index of the I2C channel to use (usually 0)
-    /// * `address` - I2C address (0x1D when ASEL=low, 0x53 when ASEL=high)
     pub fn with_address(channel_index: u32, address: u8) -> Result<Self> {
         if address != ADXL355_ADDRESS_LOW && address != ADXL355_ADDRESS_HIGH {
             return Err(Adxl355Error::InvalidParameter(format!(
@@ -242,7 +270,22 @@ impl Adxl355 {
             )));
         }
 
-        // Check number of available channels
+        let (handle, _) = Self::open_channel(channel_index)?;
+
+        let mut sensor = Adxl355 {
+            handle,
+            address,
+            range: Range::G2,
+            fifo_enabled: false,
+        };
+
+        sensor.init()?;
+
+        Ok(sensor)
+    }
+
+    /// Open and configure an I2C channel
+    fn open_channel(channel_index: u32) -> Result<(FT_HANDLE, ())> {
         let mut num_channels: DWORD = 0;
         let status = unsafe { I2C_GetNumChannels(&mut num_channels) };
         if status != FT_OK {
@@ -257,16 +300,14 @@ impl Adxl355 {
             return Err(Adxl355Error::InvalidChannel(channel_index));
         }
 
-        // Open the channel
         let mut handle: FT_HANDLE = ptr::null_mut();
         let status = unsafe { I2C_OpenChannel(channel_index, &mut handle) };
         if status != FT_OK {
             return Err(status.into());
         }
 
-        // Configure the channel
         let mut config = ChannelConfig {
-            ClockRate: I2C_CLOCK_FAST_MODE_PLUS, // 1 MHz
+            ClockRate: I2C_CLOCK_FAST_MODE_PLUS,
             LatencyTimer: 1,
             Options: 0,
             Pin: 0,
@@ -279,16 +320,7 @@ impl Adxl355 {
             return Err(status.into());
         }
 
-        let mut sensor = Adxl355 {
-            handle,
-            address,
-            range: Range::G2,
-            fifo_enabled: false,
-        };
-
-        sensor.init()?;
-
-        Ok(sensor)
+        Ok((handle, ()))
     }
 
     /// Initialize the ADXL355 sensor
@@ -518,7 +550,7 @@ impl Adxl355 {
     /// Read temperature (12-bit raw value)
     pub fn read_temperature(&mut self) -> Result<u16> {
         let data = self.read_registers(REG_TEMP2, 2)?;
-        let temp = ((data[0] as u16) << 4) | ((data[1] as u16) >> 4);
+        let temp = ((data[0] as u16) << 8) | (data[1] as u16);
         Ok(temp)
     }
 
@@ -537,8 +569,8 @@ impl Adxl355 {
     pub fn read_all(&mut self) -> Result<SensorData> {
         let data = self.read_registers(REG_TEMP2, 11)?;
 
-        // Bytes 0-1: Temperature (12-bit)
-        let temperature = ((data[0] as u16) << 4) | ((data[1] as u16) >> 4);
+        // Bytes 0-1: Temperature (12-bit, stored as high byte + low byte)
+        let temperature = ((data[0] as u16) << 8) | (data[1] as u16);
 
         // Bytes 2-10: Accel X, Y, Z (20-bit each, 3 bytes per axis)
         let accel_x = parse_20bit(data[2], data[3], data[4]);
@@ -668,43 +700,41 @@ impl Adxl355 {
 
     /// Read all available samples from the FIFO
     ///
-    /// Each FIFO sample is 9 bytes (3 bytes per axis, XYZ).
-    /// Temperature is NOT included in FIFO data.
+    /// FIFO_ENTRIES reports axis entries (not complete XYZ samples).
+    /// Each entry is 3 bytes (one axis). A complete sample = 3 entries (X, Y, Z).
+    /// Burst read from FIFO_DATA (0x11) auto-pops data without incrementing.
     pub fn read_fifo_batch(&mut self) -> Result<Vec<SensorData>> {
-        let entries = self.get_fifo_entries()?;
+        let entries = self.get_fifo_entries()? as usize;
 
         if entries == 0 {
             return Ok(Vec::new());
         }
 
-        let num_samples = entries as usize;
-        let bytes_to_read = num_samples * FIFO_SAMPLE_SIZE;
+        // FIFO_ENTRIES reports axis entries, not complete XYZ samples.
+        // Each entry is 3 bytes (one axis). A complete sample = 3 entries.
+        let num_samples = entries / 3;
+        if num_samples == 0 {
+            return Ok(Vec::new());
+        }
+        let bytes_to_read = num_samples * 9; // 3 axes × 3 bytes each
 
-        // Read all FIFO data
+        // Burst read all FIFO data (register 0x11 auto-pops, does not auto-increment)
         let fifo_data = self.read_registers(REG_FIFO_DATA, bytes_to_read)?;
 
-        // Check for overflow
-        let status = self.read_register(REG_STATUS)?;
-        if status & STATUS_FIFO_OVR != 0 {
-            // Data we read is still valid, but some samples were lost
-            // Clear by reading STATUS (already done above)
-        }
-
-        // Parse samples
+        // Parse: every 9 bytes = one XYZ sample (3 bytes per axis)
         let mut samples = Vec::with_capacity(num_samples);
         for i in 0..num_samples {
-            let offset = i * FIFO_SAMPLE_SIZE;
-            let chunk = &fifo_data[offset..offset + FIFO_SAMPLE_SIZE];
+            let offset = i * 9;
 
-            let accel_x = parse_20bit(chunk[0], chunk[1], chunk[2]);
-            let accel_y = parse_20bit(chunk[3], chunk[4], chunk[5]);
-            let accel_z = parse_20bit(chunk[6], chunk[7], chunk[8]);
+            let accel_x = parse_20bit(fifo_data[offset], fifo_data[offset + 1], fifo_data[offset + 2]);
+            let accel_y = parse_20bit(fifo_data[offset + 3], fifo_data[offset + 4], fifo_data[offset + 5]);
+            let accel_z = parse_20bit(fifo_data[offset + 6], fifo_data[offset + 7], fifo_data[offset + 8]);
 
             samples.push(SensorData {
                 accel_x,
                 accel_y,
                 accel_z,
-                temperature: 0, // Not available from FIFO
+                temperature: 0,
             });
         }
 
