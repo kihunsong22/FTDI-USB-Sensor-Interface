@@ -11,10 +11,10 @@ fn main() {
     let shared_root = project_root.parent().unwrap();
 
     // Path to MPSSE DLL (x64/64-bit)
-    let mpsse_lib_path = shared_root.join("FTDI MPSSE").join("build").join("x64").join("DLL");
+    let mpsse_lib_path = shared_root.join("00-ftdi-drivers").join("FTDI MPSSE").join("build").join("x64").join("DLL");
 
     // Path to D2XX DLL (amd64/64-bit)
-    let d2xx_lib_path = shared_root.join("FTDI-D2XX-Drivers-Win-2.12.36.20").join("amd64");
+    let d2xx_lib_path = shared_root.join("00-ftdi-drivers").join("FTDI-D2XX-Drivers-Win-2.12.36.20").join("amd64");
 
     // Tell cargo where to find the libraries
     println!("cargo:rustc-link-search=native={}", mpsse_lib_path.display());
@@ -25,8 +25,8 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=libmpsse");
 
     // Rerun if the DLL paths change
-    println!("cargo:rerun-if-changed=../FTDI MPSSE/build/x64/DLL/libmpsse.dll");
-    println!("cargo:rerun-if-changed=../FTDI-D2XX-Drivers-Win-2.12.36.20/amd64/FTD2XX64.dll");
+    println!("cargo:rerun-if-changed=../00-ftdi-drivers/FTDI MPSSE/build/x64/DLL/libmpsse.dll");
+    println!("cargo:rerun-if-changed=../00-ftdi-drivers/FTDI-D2XX-Drivers-Win-2.12.36.20/amd64/FTD2XX64.dll");
 
     // Auto-copy runtime DLLs to output directory
     // This ensures the DLLs are available when running the executable
