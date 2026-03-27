@@ -1,0 +1,10 @@
+# Cargo configuration for FT232 ADXL355 Sensor Interface
+# Library paths are handled by build.rs
+
+[build]
+# Target Windows x64 (64-bit) to match HDF5 and available DLLs
+target = "x86_64-pc-windows-msvc"
+
+[env]
+# HDF5 C library location (required for collector, analyzer)
+HDF5_DIR = "C:\\Program Files\\HDF_Group\\HDF5\\1.14.5"

@@ -1,0 +1,38 @@
+[package]
+name = "ft232-adxl355-interface"
+version = "0.1.0"
+edition = "2021"
+default-run = "adxl355-reader"
+
+[lib]
+name = "ft232_adxl355_interface"
+path = "src/lib.rs"
+
+[[bin]]
+name = "adxl355-reader"
+path = "src/main.rs"
+
+[[bin]]
+name = "collector"
+path = "src/bin/collector.rs"
+
+[[bin]]
+name = "analyzer"
+path = "src/bin/analyzer.rs"
+required-features = ["analysis"]
+
+[dependencies]
+thiserror = "1.0"
+hdf5 = { git = "https://github.com/aldanor/hdf5-rust.git" }
+chrono = "0.4"
+clap = { version = "4.4", features = ["derive"] }
+ctrlc = "3.4"
+
+# Analysis dependencies (feature-gated)
+rustfft = { version = "6.1", optional = true }
+num-complex = { version = "0.4", optional = true }
+
+[features]
+analysis = ["rustfft", "num-complex"]
+
+[build-dependencies]
