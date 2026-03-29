@@ -1,0 +1,590 @@
+device: ADXL355
+type: MEMS_accelerometer
+source:
+  datasheet: ADXL354/ADXL355 Rev. D
+  pages: [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43]
+
+interfaces:
+  spi:
+    wires: 4
+    autodetected: true
+    cpol: 0
+    cpha: 0
+    clock_hz_min: 100000
+    clock_hz_max: 10000000
+    signals: [CS, SCLK, MOSI, MISO]
+    command_byte:
+      bits_7_to_1: register_address_A6_to_A0
+      bit_0:
+        name: RnW
+        read: 1
+        write: 0
+      examples:
+        read: (addr << 1) | 0x01
+        write: (addr << 1) | 0x00
+    note: use_gated_buffer_on_SCLK_when_sharing_bus
+  i2c:
+    autodetected: true
+    speeds:
+      standard: 100000
+      fast: 400000
+      fast_plus: 1000000
+      high_speed: 3400000
+    address_select:
+      pin: MISO_ASEL
+      values:
+        0: 0x1D
+        1: 0x53
+    notes:
+      - SCLK_VSSIO_must_be_grounded
+      - no_internal_pullups_or_pulldowns
+      - point_to_point_recommended
+      - bus_conflict_bytes_0x1D: [0x3A, 0x3B]
+      - bus_conflict_bytes_0x53: [0xA6, 0xA7]
+
+data_format:
+  acceleration:
+    bits: 20
+    signed: true
+    encoding: twos_complement
+    alignment: left_justified
+    packing:
+      DATA3: bits[19:12]
+      DATA2: bits[11:4]
+      DATA1_bits_7_4: bits[3:0]
+      DATA1_bits_3_0: reserved
+    registers:
+      x: [0x08, 0x09, 0x0A]
+      y: [0x0B, 0x0C, 0x0D]
+      z: [0x0E, 0x0F, 0x10]
+    unpack_formula: "sign_extend(((DATA3 << 12) | (DATA2 << 4) | (DATA1 >> 4)), 20)"
+    notes:
+      - xyz_not_atomic_without_burst_read
+      - data_comes_from_most_recent_FIFO_entry_via_Z_PTR
+      - no_physical_axis_data_registers
+      - initiate_read_at_DATA_RDY_and_complete_within_1_over_ODR_for_coherent_set
+  temperature:
+    bits: 12
+    signed: false
+    encoding: unsigned
+    alignment: right_justified
+    packing:
+      TEMP2_bits_3_0: bits[11:8]
+      TEMP1_bits_7_0: bits[7:0]
+    registers: [0x06, 0x07]
+    intercept_lsb: 1885
+    intercept_temp_c: 25
+    slope_lsb_per_c: -9.05
+    unpack_formula: "((TEMP2 & 0x0F) << 8) | TEMP1"
+    conversion_formula: "temp_c = 25 + (1885 - temp_raw) / 9.05"
+    double_buffered: false
+
+fifo:
+  depth: 96
+  mode: stream
+  entry_bits: 21
+  entry_format:
+    data_bits: 20
+    virtual_bits: 2
+    empty_indicator_bit: 1
+    x_axis_marker_bit: 0
+  interface_bytes_per_entry: 3
+  pop_behavior:
+    single_byte_read: pops_one_location
+    multibyte_read: pops_on_first_byte_and_every_third_byte
+  auto_increment: disabled_at_FIFO_address
+  registers:
+    entries: 0x05
+    data: 0x11
+  notes:
+    - data_always_taken_in_sets_of_3_data_points
+    - overrun_overwrites_oldest_data
+    - read_via_auto_increment_from_previous_address_returns_zeros
+    - axis_atomicity_guaranteed_per_3_byte_read
+
+reserved_ranges:
+  - start: 0x12
+    end: 0x1D
+    note: not_defined_in_register_map
+
+registers:
+
+  - addr: 0x00
+    name: DEVID_AD
+    access: R
+    reset: 0xAD
+    fields:
+      - {bits: [7,0], name: DEVID_AD, type: constant}
+
+  - addr: 0x01
+    name: DEVID_MST
+    access: R
+    reset: 0x1D
+    fields:
+      - {bits: [7,0], name: DEVID_MST, type: constant}
+
+  - addr: 0x02
+    name: PARTID
+    access: R
+    reset: 0xED
+    fields:
+      - {bits: [7,0], name: PARTID, type: constant}
+
+  - addr: 0x03
+    name: REVID
+    access: R
+    reset: 0x01
+    fields:
+      - {bits: [7,0], name: REVID}
+
+  - addr: 0x04
+    name: STATUS
+    access: R
+    reset: 0x00
+    fields:
+      - {bits: [7,5], name: Reserved}
+      - {bit: 4, name: NVM_BUSY}
+      - {bit: 3, name: ACTIVITY}
+      - {bit: 2, name: FIFO_OVR}
+      - {bit: 1, name: FIFO_FULL}
+      - {bit: 0, name: DATA_RDY}
+
+  - addr: 0x05
+    name: FIFO_ENTRIES
+    access: R
+    reset: 0x00
+    fields:
+      - {bit: 7, name: Reserved}
+      - {bits: [6,0], name: FIFO_ENTRIES}
+
+  - addr: 0x06
+    name: TEMP2
+    access: R
+    reset: 0x00
+    fields:
+      - {bits: [7,4], name: Reserved}
+      - {bits: [3,0], name: TEMP[11:8]}
+
+  - addr: 0x07
+    name: TEMP1
+    access: R
+    reset: 0x00
+    fields:
+      - {bits: [7,0], name: TEMP[7:0]}
+
+  - addr: 0x08
+    name: XDATA3
+    access: R
+    reset: 0x00
+    fields:
+      - {bits: [7,0], name: XDATA[19:12]}
+
+  - addr: 0x09
+    name: XDATA2
+    access: R
+    reset: 0x00
+    fields:
+      - {bits: [7,0], name: XDATA[11:4]}
+
+  - addr: 0x0A
+    name: XDATA1
+    access: R
+    reset: 0x00
+    fields:
+      - {bits: [7,4], name: XDATA[3:0]}
+      - {bits: [3,0], name: Reserved}
+
+  - addr: 0x0B
+    name: YDATA3
+    access: R
+    reset: 0x00
+    fields:
+      - {bits: [7,0], name: YDATA[19:12]}
+
+  - addr: 0x0C
+    name: YDATA2
+    access: R
+    reset: 0x00
+    fields:
+      - {bits: [7,0], name: YDATA[11:4]}
+
+  - addr: 0x0D
+    name: YDATA1
+    access: R
+    reset: 0x00
+    fields:
+      - {bits: [7,4], name: YDATA[3:0]}
+      - {bits: [3,0], name: Reserved}
+
+  - addr: 0x0E
+    name: ZDATA3
+    access: R
+    reset: 0x00
+    fields:
+      - {bits: [7,0], name: ZDATA[19:12]}
+
+  - addr: 0x0F
+    name: ZDATA2
+    access: R
+    reset: 0x00
+    fields:
+      - {bits: [7,0], name: ZDATA[11:4]}
+
+  - addr: 0x10
+    name: ZDATA1
+    access: R
+    reset: 0x00
+    fields:
+      - {bits: [7,4], name: ZDATA[3:0]}
+      - {bits: [3,0], name: Reserved}
+
+  - addr: 0x11
+    name: FIFO_DATA
+    access: R
+    reset: 0x00
+    behavior:
+      pop_on_read: true
+      bytes_per_sample: 3
+      byte_order: MSB_first
+      auto_increment_from_previous: returns_zeros_no_pop
+
+  - addr: 0x1E
+    name: OFFSET_X_H
+    access: RW
+    reset: 0x00
+    fields:
+      - {bits: [7,0], name: OFFSET_X[15:8]}
+
+  - addr: 0x1F
+    name: OFFSET_X_L
+    access: RW
+    reset: 0x00
+    fields:
+      - {bits: [7,0], name: OFFSET_X[7:0]}
+
+  - addr: 0x20
+    name: OFFSET_Y_H
+    access: RW
+    reset: 0x00
+    fields:
+      - {bits: [7,0], name: OFFSET_Y[15:8]}
+
+  - addr: 0x21
+    name: OFFSET_Y_L
+    access: RW
+    reset: 0x00
+    fields:
+      - {bits: [7,0], name: OFFSET_Y[7:0]}
+
+  - addr: 0x22
+    name: OFFSET_Z_H
+    access: RW
+    reset: 0x00
+    fields:
+      - {bits: [7,0], name: OFFSET_Z[15:8]}
+
+  - addr: 0x23
+    name: OFFSET_Z_L
+    access: RW
+    reset: 0x00
+    fields:
+      - {bits: [7,0], name: OFFSET_Z[7:0]}
+
+  - addr: 0x24
+    name: ACT_EN
+    access: RW
+    reset: 0x00
+    fields:
+      - {bits: [7,3], name: Reserved}
+      - {bit: 2, name: ACT_Z}
+      - {bit: 1, name: ACT_Y}
+      - {bit: 0, name: ACT_X}
+
+  - addr: 0x25
+    name: ACT_THRESH_H
+    access: RW
+    reset: 0x00
+    fields:
+      - {bits: [7,0], name: ACT_THRESH[15:8]}
+
+  - addr: 0x26
+    name: ACT_THRESH_L
+    access: RW
+    reset: 0x00
+    fields:
+      - {bits: [7,0], name: ACT_THRESH[7:0]}
+
+  - addr: 0x27
+    name: ACT_COUNT
+    access: RW
+    reset: 0x01
+    fields:
+      - {bits: [7,0], name: ACT_COUNT}
+
+  - addr: 0x28
+    name: FILTER
+    access: RW
+    reset: 0x00
+    fields:
+      - {bit: 7, name: Reserved}
+      - name: HPF_CORNER
+        bits: [6,4]
+        enum:
+          0b000: no_high_pass_filter
+          0b001: 24.7e-4_x_ODR
+          0b010: 6.2084e-4_x_ODR
+          0b011: 1.5545e-4_x_ODR
+          0b100: 0.3862e-4_x_ODR
+          0b101: 0.0954e-4_x_ODR
+          0b110: 0.0238e-4_x_ODR
+      - name: ODR_LPF
+        bits: [3,0]
+        enum:
+          0x0: {odr_hz: 4000, lpf_hz: 1000}
+          0x1: {odr_hz: 2000, lpf_hz: 500}
+          0x2: {odr_hz: 1000, lpf_hz: 250}
+          0x3: {odr_hz: 500, lpf_hz: 125}
+          0x4: {odr_hz: 250, lpf_hz: 62.5}
+          0x5: {odr_hz: 125, lpf_hz: 31.25}
+          0x6: {odr_hz: 62.5, lpf_hz: 15.625}
+          0x7: {odr_hz: 31.25, lpf_hz: 7.813}
+          0x8: {odr_hz: 15.625, lpf_hz: 3.906}
+          0x9: {odr_hz: 7.813, lpf_hz: 1.953}
+          0xA: {odr_hz: 3.906, lpf_hz: 0.977}
+
+  - addr: 0x29
+    name: FIFO_SAMPLES
+    access: RW
+    reset: 0x60
+    fields:
+      - {bit: 7, name: Reserved}
+      - {bits: [6,0], name: FIFO_SAMPLES, range: [1, 96]}
+    note: default_0x60_avoids_triggering_FIFO_watermark_interrupt
+
+  - addr: 0x2A
+    name: INT_MAP
+    access: RW
+    reset: 0x00
+    fields:
+      - {bit: 7, name: ACT_EN2}
+      - {bit: 6, name: OVR_EN2}
+      - {bit: 5, name: FULL_EN2}
+      - {bit: 4, name: RDY_EN2}
+      - {bit: 3, name: ACT_EN1}
+      - {bit: 2, name: OVR_EN1}
+      - {bit: 1, name: FULL_EN1}
+      - {bit: 0, name: RDY_EN1}
+
+  - addr: 0x2B
+    name: SYNC
+    access: RW
+    reset: 0x00
+    fields:
+      - {bits: [7,3], name: Reserved}
+      - {bit: 2, name: EXT_CLK}
+      - name: EXT_SYNC
+        bits: [1,0]
+        enum:
+          0b00: internal_sync
+          0b01: external_sync_no_interpolation
+          0b10: external_sync_with_interpolation
+          0b11: reserved
+
+  - addr: 0x2C
+    name: RANGE
+    access: RW
+    reset: 0x81
+    fields:
+      - name: I2C_HS
+        bit: 7
+        enum:
+          1: high_speed_mode
+          0: fast_mode
+      - name: INT_POL
+        bit: 6
+        enum:
+          0: active_low
+          1: active_high
+      - {bits: [5,2], name: Reserved}
+      - name: RANGE
+        bits: [1,0]
+        enum:
+          0b01: ±2g
+          0b10: ±4g
+          0b11: ±8g
+
+  - addr: 0x2D
+    name: POWER_CTL
+    access: RW
+    reset: 0x01
+    fields:
+      - {bits: [7,3], name: Reserved}
+      - {bit: 2, name: DRDY_OFF}
+      - {bit: 1, name: TEMP_OFF}
+      - name: STANDBY
+        bit: 0
+        enum:
+          1: standby_mode
+          0: measurement_mode
+
+  - addr: 0x2E
+    name: SELF_TEST
+    access: RW
+    reset: 0x00
+    fields:
+      - {bits: [7,2], name: Reserved}
+      - {bit: 1, name: ST2}
+      - {bit: 0, name: ST1}
+
+  - addr: 0x2F
+    name: RESET
+    access: W
+    reset: 0x00
+    fields:
+      - {bits: [7,0], name: RESET_CODE, value: 0x52}
+
+  # Shadow registers for software reset validation
+  - addr_range: [0x50, 0x54]
+    name: SHADOW_REGISTERS
+    access: R
+    note: read_after_power_on_and_compare_after_software_reset
+
+behavior:
+
+  status_clear:
+    general_rule: status_register_clears_on_read
+    exception: not_cleared_if_underlying_condition_still_persists
+
+  data_ready:
+    status_bit: STATUS.DATA_RDY
+    set_when: new_acceleration_data_available
+    cleared_on: status_register_read
+    rearm: not_set_again_until_newer_data_than_status_read_is_available
+    corner_case: clearing_may_be_delayed_up_to_4_cycles_at_512kHz
+
+  drdy_pin:
+    type: unmaskable_interrupt_like
+    set_when: new_acceleration_data_available
+    cleared_on:
+      - FIFO_read
+      - XDATA_YDATA_or_ZDATA_read
+      - autoclear_halfway_between_output_data_sets
+    polarity: always_active_high
+    note: INT_POL_does_not_affect_DRDY
+
+  fifo_full:
+    flag: STATUS.FIFO_FULL
+    set_when: FIFO_entries_equals_FIFO_SAMPLES_setting
+    cleared_on:
+      - entries_less_than_FIFO_SAMPLES_after_reading
+      - status_register_read_when_entries_less_than_FIFO_SAMPLES
+
+  fifo_overrun:
+    flag: STATUS.FIFO_OVR
+    set_when: attempt_to_write_past_96_location_limit
+    cleared_on: status_register_read
+    rearm: not_set_again_until_data_lost_after_status_read
+
+  activity_detection:
+    condition: acceleration_magnitude_above_ACT_THRESH_for_ACT_COUNT_consecutive_samples
+    threshold_type: unsigned_magnitude
+    threshold_significance: matches_bits_18_to_3_of_XDATA_YDATA_ZDATA
+    cross_axis: overthreshold_can_shift_between_axes_and_still_count
+    cleared_on: status_register_read
+    rearm: resets_at_end_of_next_measurement_if_condition_still_met
+
+  nvm_busy:
+    flag: STATUS.NVM_BUSY
+    indicates: NVM_controller_busy_with_refresh_programming_or_BIST
+    cleared_on: status_register_read_after_NVM_idle
+    note: interrupt_functionality_requires_NVM_BUSY_cleared
+
+  synchronization_modes:
+    - ext_sync: 0b00
+      ext_clk: 0
+      mode: internal_sync_internal_clock
+      description: default_mode
+    - ext_sync: 0b10
+      ext_clk: 0
+      mode: external_sync_internal_clock_with_interpolation
+      interpolation_resolution: 64x_ODR
+      max_sample_rate_sps: 4000
+      sync_to_drdy_delay_osc_cycles:
+        0x0: 8
+        0x1: 10
+        0x2: 14
+        0x3: 22
+        0x4: 38
+        0x5: 70
+        0x6: 134
+        0x7: 262
+        0x8: 1031
+        0x9: 2054
+        0xA: 4102
+    - ext_sync: 0b01
+      ext_clk: 1
+      mode: external_sync_external_clock_no_interpolation
+      ext_clock_freq_mhz: 1.024
+      ext_clock_pin: INT2_pin13
+      sync_pin: DRDY_pin14
+      sync_pulse_width_min_us: 3.91
+      sync_setup_time_ns: 25
+      note: can_be_used_with_single_sync_pulse
+    - ext_sync: 0b10
+      ext_clk: 1
+      mode: external_sync_external_clock_with_interpolation
+      ext_clock_freq_mhz: 1.024
+      ext_clock_pin: INT2_pin13
+      sync_pin: DRDY_pin14
+      sync_pulse_width_min_us: 3.91
+      sync_setup_time_ns: 25
+      max_sample_rate_sps: 4000
+
+  offset_trim:
+    format: twos_complement
+    significance: OFFSET[15:0]_matches_DATA[19:4]
+    applied: after_all_other_signal_processing
+
+  auto_increment:
+    behavior: address_increments_on_multibyte_reads_writes
+    max_address: 0x3FF
+    wraps: false
+    fifo_exception: stops_at_FIFO_address_0x11
+
+  measurement_mode_restrictions:
+    modifiable_while_running:
+      - HPF_CORNER
+      - INT_MAP
+      - ST1
+      - ST2
+      - RESET
+    all_other_config: must_be_set_in_standby
+
+  software_reset:
+    register: 0x2F
+    code: 0x52
+    race_condition: possible_on_REVID_0x01_or_earlier
+    workaround:
+      - read_shadow_registers_0x50_to_0x54_after_power_on
+      - store_values_on_host
+      - after_each_software_reset_compare_and_retry_if_different
+    note: race_condition_does_not_occur_on_power_cycle
+
+constraints:
+
+  i2c_odr_limits:
+    100kHz: 200
+    400kHz: 800
+    scaling: linear_with_bus_speed
+    exceeding_limit: may_cause_missing_samples_or_additional_noise
+
+  fifo_read_requirement:
+    alignment: multiples_of_3_bytes
+
+notes:
+  - temperature_not_double_buffered: true
+  - xyz_not_atomic_without_burst_read: true
+  - fifo_auto_increment_stops_at_boundary: true
+  - standby_mode_resets_FIFO_pointers_and_digital_functions: true
+  - temp_processing_disabled_in_standby: true
+  - real_time_data_registers_read_from_FIFO_Z_PTR: true
