@@ -1,0 +1,46 @@
+[package]
+name = "ft232-adxl355-spi"
+version = "0.1.0"
+edition = "2021"
+default-run = "adxl355-spi-reader"
+
+[lib]
+name = "ft232_adxl355_spi"
+path = "src/lib.rs"
+
+[[bin]]
+name = "adxl355-spi-reader"
+path = "src/main.rs"
+
+[[bin]]
+name = "collector"
+path = "src/bin/collector.rs"
+
+[[bin]]
+name = "analyzer"
+path = "src/bin/analyzer.rs"
+required-features = ["analysis"]
+
+[[bin]]
+name = "spi-diag"
+path = "src/bin/spi_diag.rs"
+
+[[bin]]
+name = "spi-raw-test"
+path = "src/bin/spi_raw_test.rs"
+
+[dependencies]
+thiserror = "1.0"
+hdf5 = { git = "https://github.com/aldanor/hdf5-rust.git" }
+chrono = "0.4"
+clap = { version = "4.4", features = ["derive"] }
+ctrlc = "3.4"
+
+# Analysis dependencies (feature-gated)
+rustfft = { version = "6.1", optional = true }
+num-complex = { version = "0.4", optional = true }
+
+[features]
+analysis = ["rustfft", "num-complex"]
+
+[build-dependencies]
