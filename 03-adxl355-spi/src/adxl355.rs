@@ -198,6 +198,36 @@ impl Adxl355 {
         Ok(sensor)
     }
 
+    /// Prime the SPI bus after channel init.
+    /// The FT232H MPSSE returns invalid data for the first few SPI
+    /// transactions. A ReadWrite + split Write/Read sequence reliably
+    /// brings the bus into a working state.
+    fn prime_spi(handle: FT_HANDLE) {
+        let opts = SPI_TRANSFER_OPTIONS_SIZE_IN_BYTES
+            | SPI_TRANSFER_OPTIONS_CHIPSELECT_ENABLE
+            | SPI_TRANSFER_OPTIONS_CHIPSELECT_DISABLE;
+        let mut xfer: DWORD = 0;
+        let mut dummy_out = [0x01u8, 0x00, 0x00];
+        let mut dummy_in = [0u8; 3];
+        unsafe {
+            SPI_ReadWrite(handle, dummy_in.as_mut_ptr(), dummy_out.as_mut_ptr(),
+                3, &mut xfer, opts);
+        }
+
+        let mut cmd = [0x01u8];
+        xfer = 0;
+        unsafe {
+            SPI_Write(handle, cmd.as_mut_ptr(), 1, &mut xfer,
+                SPI_TRANSFER_OPTIONS_SIZE_IN_BYTES | SPI_TRANSFER_OPTIONS_CHIPSELECT_ENABLE);
+        }
+        let mut rd = [0u8; 2];
+        xfer = 0;
+        unsafe {
+            SPI_Read(handle, rd.as_mut_ptr(), 2, &mut xfer,
+                SPI_TRANSFER_OPTIONS_SIZE_IN_BYTES | SPI_TRANSFER_OPTIONS_CHIPSELECT_DISABLE);
+        }
+    }
+
     /// Open and configure an SPI channel
     fn open_channel(channel_index: u32) -> Result<FT_HANDLE> {
         let mut num_channels: DWORD = 0;
@@ -241,23 +271,9 @@ impl Adxl355 {
 
     /// Initialize the ADXL355 sensor
     fn init(&mut self) -> Result<()> {
-        // Debug: raw SPI_ReadWrite matching the exact working diagnostic pattern
-        {
-            let mut out = [0x80u8, 0x00, 0x00];
-            let mut inp = [0u8; 3];
-            let mut xfer: DWORD = 0;
-            let opts = SPI_TRANSFER_OPTIONS_SIZE_IN_BYTES
-                | SPI_TRANSFER_OPTIONS_CHIPSELECT_ENABLE
-                | SPI_TRANSFER_OPTIONS_CHIPSELECT_DISABLE;
-            let st = unsafe {
-                SPI_ReadWrite(self.handle, inp.as_mut_ptr(), out.as_mut_ptr(), 3, &mut xfer, opts)
-            };
-            eprintln!("DEBUG raw SPI_ReadWrite: status={} RX={:02X} {:02X} {:02X}",
-                st, inp[0], inp[1], inp[2]);
-        }
+        Self::prime_spi(self.handle);
 
         let devid_ad = self.read_register(REG_DEVID_AD)?;
-        eprintln!("DEBUG read_register(0x00) = 0x{:02X}", devid_ad);
         if devid_ad != DEVID_AD_VALUE {
             return Err(Adxl355Error::InvalidDeviceId(devid_ad));
         }
@@ -278,12 +294,23 @@ impl Adxl355 {
 
     // ========================================================================
     // SPI register operations
+    //
+    // ADXL355 SPI protocol:
+    //   Command byte = (register_address << 1) | RNW
+    //     RNW = 1 for read, 0 for write
+    //
+    // FT232H MPSSE split Write+Read transport:
+    //   The MPSSE SPI_Write sends the command byte (MOSI only).
+    //   SPI_Read clocks in the response (MISO only).
+    //   The ADXL355 has a 2-byte pipeline delay: the first 2 bytes
+    //   clocked in via SPI_Read are stale. Fresh register data begins
+    //   at byte index 2 of the Read buffer.
     // ========================================================================
 
     /// Write a single byte to a register
-    /// SPI write: CS low → [addr & 0x7F, value] → CS high
     fn write_register(&mut self, reg: u8, value: u8) -> Result<()> {
-        let mut buffer = [reg & 0x7F, value];
+        let cmd = (reg << 1) | 0x00; // write command
+        let mut buffer = [cmd, value];
         let mut transferred: DWORD = 0;
 
         let options = SPI_TRANSFER_OPTIONS_SIZE_IN_BYTES
@@ -308,69 +335,87 @@ impl Adxl355 {
     }
 
     /// Read a single byte from a register
-    /// SPI read: CS low → send [addr | 0x80] → receive [data] simultaneously → CS high
     fn read_register(&mut self, reg: u8) -> Result<u8> {
-        // ADXL355 responds during the command byte — data at in_buf[0]
-        // Send 2 bytes to get 1 byte of register data (response starts at byte 0)
-        let mut out_buf = [reg | 0x80, 0x00];
-        let mut in_buf = [0u8; 2];
+        let cmd = (reg << 1) | 0x01; // read command
+        let mut cmd_buf = [cmd];
         let mut transferred: DWORD = 0;
 
-        let options = SPI_TRANSFER_OPTIONS_SIZE_IN_BYTES
-            | SPI_TRANSFER_OPTIONS_CHIPSELECT_ENABLE
-            | SPI_TRANSFER_OPTIONS_CHIPSELECT_DISABLE;
-
+        // Write command byte (CS asserted, stays low)
         let status = unsafe {
-            SPI_ReadWrite(
+            SPI_Write(
                 self.handle,
-                in_buf.as_mut_ptr(),
-                out_buf.as_mut_ptr(),
-                2,
+                cmd_buf.as_mut_ptr(),
+                1,
                 &mut transferred,
-                options,
+                SPI_TRANSFER_OPTIONS_SIZE_IN_BYTES
+                    | SPI_TRANSFER_OPTIONS_CHIPSELECT_ENABLE,
             )
         };
-
         if status != FT_OK {
             return Err(status.into());
         }
 
-        Ok(in_buf[0])
+        // Read 3 bytes (2 stale pipeline + 1 fresh), then CS deasserted
+        let mut data = [0u8; 3];
+        transferred = 0;
+        let status = unsafe {
+            SPI_Read(
+                self.handle,
+                data.as_mut_ptr(),
+                3,
+                &mut transferred,
+                SPI_TRANSFER_OPTIONS_SIZE_IN_BYTES
+                    | SPI_TRANSFER_OPTIONS_CHIPSELECT_DISABLE,
+            )
+        };
+        if status != FT_OK {
+            return Err(status.into());
+        }
+
+        Ok(data[2]) // skip 2-byte pipeline delay
     }
 
-    /// Read multiple bytes from consecutive registers (or FIFO)
-    /// SPI read: CS low → send [addr | 0x80, 0x00 × count] → response starts at in_buf[0]
+    /// Read multiple bytes from consecutive registers
     fn read_registers(&mut self, reg: u8, count: usize) -> Result<Vec<u8>> {
-        // ADXL355 responds starting at byte 0 (overlapping command byte)
-        // Send 1 command + count bytes, read count+1 bytes, data starts at in_buf[0]
-        let total = 1 + count;
-        let mut out_buf = vec![0u8; total];
-        out_buf[0] = reg | 0x80;
-
-        let mut in_buf = vec![0u8; total];
+        let cmd = (reg << 1) | 0x01; // read command
+        let mut cmd_buf = [cmd];
         let mut transferred: DWORD = 0;
 
-        let options = SPI_TRANSFER_OPTIONS_SIZE_IN_BYTES
-            | SPI_TRANSFER_OPTIONS_CHIPSELECT_ENABLE
-            | SPI_TRANSFER_OPTIONS_CHIPSELECT_DISABLE;
-
+        // Write command byte (CS asserted, stays low)
         let status = unsafe {
-            SPI_ReadWrite(
+            SPI_Write(
                 self.handle,
-                in_buf.as_mut_ptr(),
-                out_buf.as_mut_ptr(),
-                total as DWORD,
+                cmd_buf.as_mut_ptr(),
+                1,
                 &mut transferred,
-                options,
+                SPI_TRANSFER_OPTIONS_SIZE_IN_BYTES
+                    | SPI_TRANSFER_OPTIONS_CHIPSELECT_ENABLE,
             )
         };
-
         if status != FT_OK {
             return Err(status.into());
         }
 
-        // Data starts at byte 0, take first `count` bytes
-        Ok(in_buf[..count].to_vec())
+        // Read count+2 bytes (2 stale pipeline + count fresh), then CS deasserted
+        let total = count + 2;
+        let mut data = vec![0u8; total];
+        transferred = 0;
+        let status = unsafe {
+            SPI_Read(
+                self.handle,
+                data.as_mut_ptr(),
+                total as DWORD,
+                &mut transferred,
+                SPI_TRANSFER_OPTIONS_SIZE_IN_BYTES
+                    | SPI_TRANSFER_OPTIONS_CHIPSELECT_DISABLE,
+            )
+        };
+        if status != FT_OK {
+            return Err(status.into());
+        }
+
+        // Skip 2-byte pipeline delay
+        Ok(data[2..].to_vec())
     }
 
     // ========================================================================

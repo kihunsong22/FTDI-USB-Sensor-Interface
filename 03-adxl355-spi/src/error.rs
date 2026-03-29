@@ -14,8 +14,8 @@ pub enum Adxl355Error {
         description: String,
     },
 
-    /// No I2C channels found
-    #[error("No I2C channels found")]
+    /// No SPI channels found
+    #[error("No SPI channels found")]
     NoChannelsFound,
 
     /// Invalid channel index

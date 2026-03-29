@@ -29,6 +29,10 @@ path = "src/bin/spi_diag.rs"
 name = "spi-raw-test"
 path = "src/bin/spi_raw_test.rs"
 
+[[bin]]
+name = "validate-data"
+path = "src/bin/validate_data.rs"
+
 [dependencies]
 thiserror = "1.0"
 hdf5 = { git = "https://github.com/aldanor/hdf5-rust.git" }

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("ADXL355 Sensor Reader");
     println!("=====================");
-    println!("Initializing FT232H I2C interface...");
+    println!("Initializing FT232H SPI interface...");
 
     let mut sensor = match Adxl355::new(0) {
         Ok(s) => {
@@ -99,7 +99,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             print!("\x1B[H");
             println!("ADXL355 Sensor Reader - FIFO Mode ({} Hz ODR)                   ", odr.as_hz());
             println!("==================================                              ");
-            println!("Time: {:.2}s | Samples: {} | Rate: {:.1} Hz | Batch: {}         ",
+            println!("Time: {:.2}s | Samples: {} | Rate: {:.0} Hz | Batch: {}         ",
                 elapsed, total_samples, sample_rate, last_batch_size);
             println!("Temperature: {}                                                  ", temp_str);
             println!();

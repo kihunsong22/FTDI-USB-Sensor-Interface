@@ -103,6 +103,14 @@ extern "C" {
         sizeTransfered: LPDWORD,
         options: DWORD,
     ) -> FT_STATUS;
+
+    pub fn SPI_Read(
+        handle: FT_HANDLE,
+        buffer: *mut UCHAR,
+        sizeToTransfer: DWORD,
+        sizeTransferred: LPDWORD,
+        options: DWORD,
+    ) -> FT_STATUS;
 }
 
 pub fn status_to_string(status: FT_STATUS) -> &'static str {
