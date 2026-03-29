@@ -283,7 +283,9 @@ impl Adxl355 {
             return Err(Adxl355Error::InvalidPartId(partid));
         }
 
-        self.write_register(REG_RANGE, Range::G2 as u8)?;
+        // Read-modify-write to preserve upper bits (I2C_HS, INT_POL) — same as set_range()
+        let current_range = self.read_register(REG_RANGE)?;
+        self.write_register(REG_RANGE, (current_range & 0xFC) | (Range::G2 as u8))?;
         self.write_register(REG_FILTER, OutputDataRate::Odr1000 as u8)?;
         self.write_register(REG_POWER_CTL, 0x00)?;
 
@@ -587,7 +589,8 @@ impl Adxl355 {
     }
 
     pub fn get_fifo_entries(&mut self) -> Result<u8> {
-        self.read_register(REG_FIFO_ENTRIES)
+        // Bit 7 is reserved; only bits [6:0] hold the entry count (0–96)
+        Ok(self.read_register(REG_FIFO_ENTRIES)? & 0x7F)
     }
 
     /// Read all available samples from the FIFO (single SPI transaction for data)

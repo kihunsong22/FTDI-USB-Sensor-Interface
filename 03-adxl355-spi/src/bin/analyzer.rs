@@ -4,8 +4,7 @@
 
 use clap::Parser;
 use ft232_adxl355_spi::{Hdf5Reader, Range, TimestampedSample};
-use num_complex::Complex;
-use rustfft::FftPlanner;
+use ft232_adxl355_spi::analysis::{compute_rms, find_frequency_peaks};
 use std::f64::consts::PI;
 use std::fs::File;
 use std::io::{self, Write};
@@ -206,60 +205,6 @@ fn run_statistics_analysis(output: &mut dyn Write, samples: &[TimestampedSample]
 // FFT
 // ============================================================================
 
-struct FrequencyPeak {
-    frequency: f64,
-    magnitude: f64,
-}
-
-fn apply_hann_window(data: &[f32]) -> Vec<f64> {
-    let n = data.len();
-    data.iter()
-        .enumerate()
-        .map(|(i, &x)| {
-            let window = 0.5 * (1.0 - ((2.0 * PI * i as f64) / (n as f64 - 1.0)).cos());
-            x as f64 * window
-        })
-        .collect()
-}
-
-fn analyze_frequencies(data: &[f32], sample_rate: f64, window_size: usize) -> Vec<FrequencyPeak> {
-    if data.len() < window_size {
-        return Vec::new();
-    }
-
-    let windowed = apply_hann_window(&data[..window_size]);
-
-    let mut buffer: Vec<Complex<f64>> = windowed.iter()
-        .map(|&x| Complex::new(x, 0.0))
-        .collect();
-
-    let mut planner = FftPlanner::new();
-    let fft = planner.plan_fft_forward(window_size);
-    fft.process(&mut buffer);
-
-    let magnitudes: Vec<f64> = buffer.iter()
-        .take(window_size / 2)
-        .map(|c| c.norm() / (window_size as f64))
-        .collect();
-
-    let threshold = magnitudes.iter().copied().fold(0.0, f64::max) * 0.1;
-    let mut peaks: Vec<FrequencyPeak> = Vec::new();
-
-    for i in 1..magnitudes.len() - 1 {
-        if magnitudes[i] > threshold
-            && magnitudes[i] > magnitudes[i - 1]
-            && magnitudes[i] > magnitudes[i + 1] {
-            peaks.push(FrequencyPeak {
-                frequency: (i as f64 * sample_rate) / window_size as f64,
-                magnitude: magnitudes[i],
-            });
-        }
-    }
-
-    peaks.sort_by(|a, b| b.magnitude.partial_cmp(&a.magnitude).unwrap());
-    peaks
-}
-
 fn run_fft_analysis(output: &mut dyn Write, samples: &[TimestampedSample], sample_rate: f64, range: Range) -> io::Result<()> {
     const WINDOW_SIZE: usize = 2048;
 
@@ -285,14 +230,14 @@ fn run_fft_analysis(output: &mut dyn Write, samples: &[TimestampedSample], sampl
     writeln!(output, "{:-<80}", "")?;
 
     for (label, data) in [("Accel X", &accel_x), ("Accel Y", &accel_y), ("Accel Z", &accel_z)] {
-        let peaks = analyze_frequencies(data, sample_rate, WINDOW_SIZE);
+        let peaks = find_frequency_peaks(data, sample_rate, WINDOW_SIZE);
         writeln!(output, "\n{} - Top 5 Frequency Peaks:", label)?;
         if peaks.is_empty() {
             writeln!(output, "  No significant peaks detected")?;
         } else {
             for (i, peak) in peaks.iter().take(5).enumerate() {
                 writeln!(output, "  {}. {:.2} Hz (magnitude: {:.6})",
-                    i + 1, peak.frequency, peak.magnitude)?;
+                    i + 1, peak.frequency_hz, peak.magnitude)?;
             }
         }
     }
@@ -303,11 +248,6 @@ fn run_fft_analysis(output: &mut dyn Write, samples: &[TimestampedSample], sampl
 // ============================================================================
 // VIBRATION
 // ============================================================================
-
-fn compute_rms(data: &[f32]) -> f32 {
-    let sum_squares: f32 = data.iter().map(|&x| x * x).sum();
-    (sum_squares / data.len() as f32).sqrt()
-}
 
 fn high_pass_filter(data: &[f32], cutoff_hz: f64, sample_rate: f64) -> Vec<f32> {
     let rc = 1.0 / (2.0 * PI * cutoff_hz);
