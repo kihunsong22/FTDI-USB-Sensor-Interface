@@ -1,0 +1,76 @@
+ADXL355 SPI Sensor Tools
+========================
+
+All commands use: cargo run --bin <name> [--features analysis] -- [options]
+
+
+1. adxl355-spi-reader (default)
+-------------------------------
+Live display with accelerometer bars, temperature, and sample rate.
+Optional RMS/FFT overlay with --features analysis.
+
+  cargo run
+  cargo run --features analysis
+
+
+2. collector
+------------
+Record sensor data to HDF5 file.
+
+Options:
+  -m, --mode <MODE>        "polling" or "fifo" (default: polling)
+  -r, --rate <RATE>        Sample rate in Hz (default: 100)
+  -d, --duration <SECS>    Recording length (default: until Ctrl+C)
+  -o, --output <FILE>      Output path (default: sensor_data.h5)
+
+FIFO mode is faster and more reliable than polling for high rates.
+Rate maps to nearest ODR preset: 4000, 2000, 1000, 500, 250, 125, 62.5, 31.25 Hz
+
+Examples:
+  cargo run --bin collector -- --mode fifo --rate 1000 --duration 10
+  cargo run --bin collector -- --mode fifo --rate 4000 --duration 30 --output fast.h5
+  cargo run --bin collector -- --mode polling --rate 100 --duration 60
+  cargo run --bin collector -- --mode fifo --rate 1000           # runs until Ctrl+C
+
+
+3. analyzer
+-----------
+Analyze recorded HDF5 files. Requires --features analysis.
+
+Options:
+  -i, --input <FILE>       Input HDF5 file (required)
+      --statistics         Mean, RMS, std dev, min/max, peak-to-peak
+      --fft                Frequency peak detection (needs 2048+ samples)
+      --vibration          RMS acceleration, velocity, displacement
+      --all                Run all analyses (default if none specified)
+      --start <SECS>       Start of analysis window
+      --end <SECS>         End of analysis window
+  -o, --output <FILE>      Write report to file (default: stdout)
+
+Examples:
+  cargo run --bin analyzer --features analysis -- -i sensor_data.h5
+  cargo run --bin analyzer --features analysis -- -i sensor_data.h5 --fft
+  cargo run --bin analyzer --features analysis -- -i sensor_data.h5 --start 1.0 --end 5.0
+  cargo run --bin analyzer --features analysis -- -i sensor_data.h5 -o report.txt
+
+
+4. validate-data
+----------------
+Run diagnostic checks on live sensor: FIFO fill rate, data freshness,
+physical plausibility, sustained rate, temperature.
+
+  cargo run --bin validate-data
+
+
+5. spi-diag
+-----------
+Test SPI transport methods and command formats.
+
+  cargo run --bin spi-diag
+
+
+6. spi-raw-test
+---------------
+Minimal raw SPI read (DEVID_AD register) with inline FFI.
+
+  cargo run --bin spi-raw-test

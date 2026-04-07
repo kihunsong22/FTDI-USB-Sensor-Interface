@@ -59,14 +59,11 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         _ => Range::G2,
     };
 
-    let run_statistics = args.all || args.statistics;
-    let run_fft = args.all || args.fft;
-    let run_vibration = args.all || args.vibration;
-
-    if !run_statistics && !run_fft && !run_vibration {
-        eprintln!("Error: Must specify at least one analysis type (--statistics, --fft, --vibration, or --all)");
-        std::process::exit(1);
-    }
+    // Default to all analyses if none specified
+    let run_all = args.all || (!args.statistics && !args.fft && !args.vibration);
+    let run_statistics = run_all || args.statistics;
+    let run_fft = run_all || args.fft;
+    let run_vibration = run_all || args.vibration;
 
     println!("Loading data from {}...", args.input.display());
     let total_samples = reader.get_total_samples()?;
