@@ -97,8 +97,24 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // Compute actual sample rate from timestamps (more accurate than metadata ODR)
+    let sample_rate = if samples.len() >= 2 {
+        let first_ts = samples.first().unwrap().timestamp;
+        let last_ts = samples.last().unwrap().timestamp;
+        let duration = last_ts - first_ts;
+        if duration > 0.0 {
+            (samples.len() - 1) as f64 / duration
+        } else {
+            metadata.sample_rate_hz
+        }
+    } else {
+        metadata.sample_rate_hz
+    };
+
     println!("Loaded {} samples ({:.2}s to {:.2}s)",
         samples.len(), samples.first().unwrap().timestamp, samples.last().unwrap().timestamp);
+    println!("Measured sample rate: {:.1} Hz (configured ODR: {:.1} Hz)",
+        sample_rate, metadata.sample_rate_hz);
 
     let mut output: Box<dyn Write> = if let Some(path) = args.output {
         Box::new(File::create(path)?)
@@ -115,7 +131,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     writeln!(output, "  Sensor: {}", metadata.sensor_type)?;
     writeln!(output, "  Range: {}", metadata.range)?;
     writeln!(output, "  Acquisition mode: {}", metadata.acquisition_mode)?;
-    writeln!(output, "  Sample rate: {:.1} Hz", metadata.sample_rate_hz)?;
+    writeln!(output, "  Configured ODR: {:.1} Hz", metadata.sample_rate_hz)?;
+    writeln!(output, "  Measured sample rate: {:.1} Hz", sample_rate)?;
     writeln!(output, "  Start time: {}", metadata.start_time)?;
     writeln!(output)?;
     writeln!(output, "Analysis Range:")?;
@@ -135,14 +152,14 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         writeln!(output, "\n{}", "=".repeat(80))?;
         writeln!(output, "FREQUENCY ANALYSIS (FFT)")?;
         writeln!(output, "{}", "=".repeat(80))?;
-        run_fft_analysis(&mut output, &samples, metadata.sample_rate_hz, range)?;
+        run_fft_analysis(&mut output, &samples, sample_rate, range)?;
     }
 
     if run_vibration {
         writeln!(output, "\n{}", "=".repeat(80))?;
         writeln!(output, "VIBRATION ANALYSIS")?;
         writeln!(output, "{}", "=".repeat(80))?;
-        run_vibration_analysis(&mut output, &samples, metadata.sample_rate_hz, range)?;
+        run_vibration_analysis(&mut output, &samples, sample_rate, range)?;
     }
 
     writeln!(output, "\n{}", "=".repeat(80))?;
@@ -310,11 +327,21 @@ fn run_vibration_analysis(output: &mut dyn Write, samples: &[TimestampedSample],
     writeln!(output, "  Total: {:.6}g", rms_total)?;
     writeln!(output)?;
 
+    // Remove DC offset (gravity) before filtering and integration
+    let n = accel_x.len() as f32;
+    let mean_x: f32 = accel_x.iter().sum::<f32>() / n;
+    let mean_y: f32 = accel_y.iter().sum::<f32>() / n;
+    let mean_z: f32 = accel_z.iter().sum::<f32>() / n;
+
+    let accel_x_ac: Vec<f32> = accel_x.iter().map(|&a| a - mean_x).collect();
+    let accel_y_ac: Vec<f32> = accel_y.iter().map(|&a| a - mean_y).collect();
+    let accel_z_ac: Vec<f32> = accel_z.iter().map(|&a| a - mean_z).collect();
+
     // High-pass filter and integrate to velocity
     const G_TO_MS2: f64 = 9.81;
-    let accel_x_filtered = high_pass_filter(&accel_x, 0.5, sample_rate);
-    let accel_y_filtered = high_pass_filter(&accel_y, 0.5, sample_rate);
-    let accel_z_filtered = high_pass_filter(&accel_z, 0.5, sample_rate);
+    let accel_x_filtered = high_pass_filter(&accel_x_ac, 0.5, sample_rate);
+    let accel_y_filtered = high_pass_filter(&accel_y_ac, 0.5, sample_rate);
+    let accel_z_filtered = high_pass_filter(&accel_z_ac, 0.5, sample_rate);
 
     let accel_x_ms2: Vec<f32> = accel_x_filtered.iter().map(|&a| a * G_TO_MS2 as f32).collect();
     let accel_y_ms2: Vec<f32> = accel_y_filtered.iter().map(|&a| a * G_TO_MS2 as f32).collect();

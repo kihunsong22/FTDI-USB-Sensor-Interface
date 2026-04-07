@@ -120,6 +120,13 @@ impl SensorData {
     }
 }
 
+/// Result of a FIFO batch read, including overflow detection
+#[derive(Debug, Clone)]
+pub struct FifoBatchResult {
+    pub samples: Vec<SensorData>,
+    pub overflow_detected: bool,
+}
+
 /// Parse 20-bit two's complement value from 3 bytes
 fn parse_20bit(high: u8, mid: u8, low: u8) -> i32 {
     let raw = ((high as u32) << 12) | ((mid as u32) << 4) | ((low as u32) >> 4);
@@ -642,6 +649,59 @@ impl Adxl355 {
         }
 
         Ok(samples)
+    }
+
+    /// Read FIFO batch with overflow detection
+    pub fn read_fifo_batch_checked(&mut self) -> Result<FifoBatchResult> {
+        let entries = self.get_fifo_entries()? as usize;
+
+        if entries < 3 {
+            return Ok(FifoBatchResult { samples: Vec::new(), overflow_detected: false });
+        }
+
+        let num_samples = entries / 3;
+        let bytes_to_read = num_samples * 9;
+
+        let fifo_data = self.read_registers(REG_FIFO_DATA, bytes_to_read)?;
+
+        let mut samples = Vec::with_capacity(num_samples);
+        let mut i = 0;
+        let mut overflow_detected = false;
+
+        // Find first X-axis entry for alignment
+        while i + 2 < fifo_data.len() {
+            if fifo_data[i + 2] & 0x02 != 0 {
+                overflow_detected = true;
+                return Ok(FifoBatchResult { samples, overflow_detected });
+            }
+            if fifo_data[i + 2] & 0x01 != 0 {
+                break;
+            }
+            i += 3;
+        }
+
+        // Parse aligned XYZ triplets
+        while i + 8 < fifo_data.len() {
+            if fifo_data[i + 2] & 0x02 != 0 {
+                overflow_detected = true;
+                break;
+            }
+
+            let accel_x = parse_20bit(fifo_data[i], fifo_data[i + 1], fifo_data[i + 2]);
+            let accel_y = parse_20bit(fifo_data[i + 3], fifo_data[i + 4], fifo_data[i + 5]);
+            let accel_z = parse_20bit(fifo_data[i + 6], fifo_data[i + 7], fifo_data[i + 8]);
+
+            samples.push(SensorData {
+                accel_x,
+                accel_y,
+                accel_z,
+                temperature: 0,
+            });
+
+            i += 9;
+        }
+
+        Ok(FifoBatchResult { samples, overflow_detected })
     }
 
     pub fn stream_fifo<F>(&mut self, batch_interval_ms: u64, mut callback: F) -> Result<u64>

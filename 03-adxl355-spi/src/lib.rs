@@ -12,7 +12,7 @@ pub mod common;
 pub mod analysis;
 
 pub use error::{Adxl355Error, Result};
-pub use adxl355::{Adxl355, SensorData, StreamControl, Range, OutputDataRate};
+pub use adxl355::{Adxl355, SensorData, StreamControl, Range, OutputDataRate, FifoBatchResult};
 pub use hdf5_format::{Hdf5Reader, Hdf5Writer, Metadata, TimestampedSample};
 pub use common::{TimeKeeper, create_bar};
 #[cfg(feature = "analysis")]

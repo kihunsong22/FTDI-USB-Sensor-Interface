@@ -145,6 +145,8 @@ fn collect_polling(
     let timer = TimeKeeper::new();
     let mut sample_buffer = Vec::with_capacity(100);
     let mut last_flush = std::time::Instant::now();
+    let mut last_progress = std::time::Instant::now();
+    let mut progress_count: u64 = 0;
 
     sensor.stream(rate, |data| {
         if !running.load(Ordering::SeqCst) {
@@ -163,6 +165,7 @@ fn collect_polling(
         };
 
         sample_buffer.push(sample);
+        progress_count += 1;
 
         if sample_buffer.len() >= 100 {
             if let Err(e) = writer.append_batch(&sample_buffer) {
@@ -179,8 +182,18 @@ fn collect_polling(
             }
         }
 
+        if last_progress.elapsed() >= std::time::Duration::from_secs(2) {
+            let elapsed = timer.elapsed_secs();
+            let rate = progress_count as f64 / elapsed;
+            eprint!("\r  Collected {} samples in {:.1}s ({:.0} Hz)    ",
+                progress_count, elapsed, rate);
+            last_progress = std::time::Instant::now();
+        }
+
         StreamControl::Continue
     })?;
+
+    eprintln!();
 
     if !sample_buffer.is_empty() {
         writer.append_batch(&sample_buffer)?;
@@ -203,52 +216,84 @@ fn collect_fifo(
 
     let timer = TimeKeeper::new();
     let mut last_flush = std::time::Instant::now();
+    let mut last_progress = std::time::Instant::now();
     let sample_rate = odr.as_hz();
+    let dt = 1.0 / sample_rate;
+    let mut total_samples: u64 = 0;
+    let mut overflow_count: u64 = 0;
+    let mut write_buffer: Vec<TimestampedSample> = Vec::with_capacity(256);
 
-    sensor.stream_fifo(20, |batch| {
+    // Wait long enough to accumulate ~10 samples, but stay well under FIFO capacity (32 samples).
+    // Minimum 1ms to avoid busy-spinning.
+    let poll_sleep = std::time::Duration::from_micros(
+        ((10.0 / sample_rate) * 1_000_000.0) as u64
+    ).max(std::time::Duration::from_millis(1));
+
+    loop {
         if !running.load(Ordering::SeqCst) {
-            return StreamControl::Break;
+            break;
         }
-
         if let Some(end) = end_time {
             if std::time::Instant::now() >= end {
-                return StreamControl::Break;
+                break;
             }
         }
 
+        let result = sensor.read_fifo_batch_checked()?;
+        if result.overflow_detected {
+            overflow_count += 1;
+        }
+        let batch = result.samples;
+
         if batch.is_empty() {
-            return StreamControl::Continue;
+            std::thread::sleep(poll_sleep);
+            continue;
         }
 
         let batch_end_time = timer.elapsed_secs();
         let batch_size = batch.len();
-        let dt = 1.0 / sample_rate;
 
-        let timestamped_samples: Vec<TimestampedSample> = batch.iter()
-            .enumerate()
-            .map(|(i, data)| {
-                let timestamp = batch_end_time - (batch_size - 1 - i) as f64 * dt;
-                TimestampedSample {
-                    timestamp,
-                    data: *data,
-                }
-            })
-            .collect();
-
-        if let Err(e) = writer.append_batch(&timestamped_samples) {
-            eprintln!("Write error: {}", e);
-            return StreamControl::Break;
+        for (i, data) in batch.iter().enumerate() {
+            let timestamp = (batch_end_time - (batch_size - 1 - i) as f64 * dt).max(0.0);
+            write_buffer.push(TimestampedSample { timestamp, data: *data });
         }
 
-        if last_flush.elapsed() >= std::time::Duration::from_secs(10) {
-            if let Err(e) = writer.flush() {
-                eprintln!("Flush error: {}", e);
+        total_samples += batch_size as u64;
+
+        // Write to HDF5 in larger batches to avoid per-call resize overhead
+        if write_buffer.len() >= 200 {
+            if let Err(e) = writer.append_batch(&write_buffer) {
+                eprintln!("Write error: {}", e);
+                break;
             }
-            last_flush = std::time::Instant::now();
+            write_buffer.clear();
+
+            if last_flush.elapsed() >= std::time::Duration::from_secs(10) {
+                if let Err(e) = writer.flush() {
+                    eprintln!("Flush error: {}", e);
+                }
+                last_flush = std::time::Instant::now();
+            }
         }
 
-        StreamControl::Continue
-    })?;
+        if last_progress.elapsed() >= std::time::Duration::from_secs(2) {
+            let elapsed = timer.elapsed_secs();
+            let rate = total_samples as f64 / elapsed;
+            eprint!("\r  Collected {} samples in {:.1}s ({:.0} Hz)    ",
+                total_samples, elapsed, rate);
+            last_progress = std::time::Instant::now();
+        }
+    }
+
+    // Flush remaining buffered samples
+    if !write_buffer.is_empty() {
+        writer.append_batch(&write_buffer)?;
+    }
+
+    eprintln!();
+    if overflow_count > 0 {
+        eprintln!("Warning: {} FIFO overflow(s) detected — some samples were lost", overflow_count);
+    }
 
     sensor.disable_fifo()?;
     writer.flush()?;
