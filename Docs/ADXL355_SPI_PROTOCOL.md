@@ -4,8 +4,7 @@
 
 Working. Sensor init, register R/W, FIFO streaming, and HDF5 collection all functional. Validated with 7-point data integrity check (`validate-data` binary).
 
-- 1kHz ODR: ~993 Hz effective (lossless)
-- 4kHz ODR: ~2830 Hz effective (FIFO overflow, USB bandwidth limited)
+- 1 / 2 / 4 kHz ODR: lossless (measured 2026-10-15, see Performance)
 
 ## Current Configuration
 
@@ -15,16 +14,20 @@ Working. Sensor init, register R/W, FIFO streaming, and HDF5 collection all func
 - CS: DBUS3, active low
 - Sensor range: ±2g (scale factor 256,000 LSB/g)
 - FIFO: 96 entries = 32 complete XYZ samples (3 entries per sample, 3 bytes per entry)
+- FIFO overflow: `STATUS.FIFO_OVR` (0x04 bit 2) latches when a sample is dropped and clears on read. Each poll reads STATUS + FIFO_ENTRIES (0x04–0x05) in one 2-byte transaction.
 - Temperature: read separately via register, not available in FIFO
 
 ### Performance
 
-Each FIFO poll requires 4 USB round-trips (2 split Write+Read transactions): one to read `FIFO_ENTRIES`, one to read the data. USB transaction latency is the bottleneck, not byte throughput.
+Each FIFO poll is 2 split Write+Read transactions (`FIFO_ENTRIES`, then the data). A register read takes ~0.4 ms and a full poll < 1 ms, far inside the 8 ms it takes the FIFO to fill at 4 kHz.
 
-| ODR | Effective Rate | Sample Loss | Notes |
-|-----|---------------|-------------|-------|
-| 1 kHz | ~993 Hz | ~0% | USB keeps up |
-| 4 kHz | ~2830 Hz | ~30% | FIFO overflows between polls |
+| ODR | Effective Rate (sensor clock runs ~0.5% fast) | Sample Loss |
+|-----|---------------|-------------|
+| 1 kHz | ~1005 Hz | 0% |
+| 2 kHz | ~2010 Hz | 0% |
+| 4 kHz | ~4020 Hz | 0% |
+
+The earlier ~30% loss at 4 kHz (~2830 Hz) was not USB latency; it was the RX offset described under Transport Quirks.
 
 ## SPI Command Format
 
@@ -36,20 +39,16 @@ This was not obvious. Many SPI sensors use `addr | 0x80` for reads (bit 7 = R/W)
 
 ## FT232H MPSSE Transport Quirks
 
-Three non-obvious behaviors were discovered empirically:
+### Never call SPI_ReadWrite
 
-### 1. Bus priming required after channel init
+This libMPSSE build answers `SPI_ReadWrite` with the MPSSE bad-command reply (`0xFA 0x00`). Those 2 bytes stay in the FTDI RX queue, so every later `SPI_Read` returns the previous transaction's last 2 bytes first.
 
-The first 2-3 SPI transactions after `SPI_InitChannel` return invalid data (0xFF or noise). A priming sequence is required: one `SPI_ReadWrite` followed by a split `SPI_Write` + `SPI_Read`.
+Earlier code primed the bus with `SPI_ReadWrite` after init and then compensated by reading `count + 2` bytes and dropping the first 2 (documented as a "2-byte pipeline delay"). That workaround clocked 2 extra bytes out of `FIFO_DATA` on every read, eating into the next FIFO entry and losing ~1 sample per poll.
 
-### 2. SPI_ReadWrite (full-duplex) is unreliable for reads
+Verified with `FT_GetQueueStatus`: right after `SPI_InitChannel` the RX queue is empty and exact-length split reads return `DEVID_AD/DEVID_MST/PARTID = AD 1D ED` on the first transaction; each `SPI_ReadWrite` leaves 2 bytes behind. libMPSSE already resets and purges the device in `SPI_InitChannel`, so no priming is needed.
 
-`SPI_ReadWrite` only returns valid data once after priming, then reverts to garbage. All production reads use the split approach: `SPI_Write` (cmd byte, CS stays asserted) followed by `SPI_Read` (data bytes, CS deasserts).
-
-### 3. 2-byte pipeline delay on SPI_Read
-
-The first 2 bytes returned by `SPI_Read` are stale (from a previous transaction's auto-increment state). Fresh register data begins at byte index 2. All reads request `count + 2` bytes and discard the first 2.
+All reads use the split approach with exact lengths: `SPI_Write` (cmd byte, CS stays asserted) followed by `SPI_Read` (`count` bytes, CS deasserts).
 
 ## Write Path
 
-`SPI_Write` with both `CS_ENABLE` and `CS_DISABLE` flags works normally — no pipeline issues. The command byte + data byte are sent in a single call.
+`SPI_Write` with both `CS_ENABLE` and `CS_DISABLE` flags works normally. The command byte + data byte are sent in a single call.

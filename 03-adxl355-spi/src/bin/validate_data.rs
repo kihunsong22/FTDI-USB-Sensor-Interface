@@ -6,9 +6,9 @@
 //! 3. Axis markers in raw FIFO data are correct (X=0x01 flag on byte[2])
 //! 4. Accelerometer values are physically plausible (~1g on Z for stationary)
 //! 5. Samples within a batch vary (not all identical = stale)
-//! 6. Raw pipeline bytes (the 2 skipped bytes) vs fresh bytes
+//! 6. Register reads return plausible values (FIFO_ENTRIES)
 
-use ft232_adxl355_spi::{Adxl355, OutputDataRate, Range};
+use ft232_adxl355_spi::{Adxl355, OutputDataRate};
 use std::time::{Duration, Instant};
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -132,9 +132,9 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         println!("  WARN: rate {:.0} Hz deviates from 1kHz target\n", rate);
     }
 
-    // ── Test 6: Raw pipeline verification ──
-    println!("=== Test 6: Pipeline byte inspection ===");
-    println!("  Reading FIFO_ENTRIES via read_register (uses 2-byte skip)...");
+    // ── Test 6: Register read ──
+    println!("=== Test 6: Register read ===");
+    println!("  Reading FIFO_ENTRIES...");
     let _ = sensor.read_fifo_batch(); // drain
     std::thread::sleep(Duration::from_millis(50));
     let entries = sensor.get_fifo_entries()?;
@@ -156,7 +156,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         println!("  FAIL: temperature {:.1}°C seems wrong\n", temp_c);
     }
 
-    sensor.disable_fifo()?;
+    sensor.standby()?;
     println!("=== All checks complete ===");
     Ok(())
 }

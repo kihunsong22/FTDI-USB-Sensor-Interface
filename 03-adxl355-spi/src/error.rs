@@ -43,7 +43,6 @@ pub enum Adxl355Error {
     InvalidParameter(String),
 
     /// FIFO overflow error
-    #[allow(dead_code)]
     #[error("FIFO overflow: data loss occurred")]
     FifoOverflow,
 

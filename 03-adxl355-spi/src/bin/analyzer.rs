@@ -3,9 +3,10 @@
 //! Post-processing analysis tool for sensor data from HDF5 files.
 
 use clap::Parser;
-use ft232_adxl355_spi::{Hdf5Reader, Range, TimestampedSample};
-use ft232_adxl355_spi::analysis::{compute_rms, find_frequency_peaks};
-use std::f64::consts::PI;
+use ft232_adxl355_spi::{Hdf5Reader, Metadata, Range, TimestampedSample};
+use ft232_adxl355_spi::analysis::{
+    fft_segment_count, find_frequency_peaks, overall_vibration, vibration_band, SETTLE_SECONDS, STANDARD_GRAVITY, VELOCITY_BAND_HIGH_HZ,
+};
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -34,7 +35,7 @@ struct Args {
     #[arg(long)]
     statistics: bool,
 
-    /// Compute vibration metrics (RMS, velocity, displacement)
+    /// Meter-style vibration values (velocity RMS, accel peak, displacement P-P)
     #[arg(long)]
     vibration: bool,
 
@@ -156,7 +157,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         writeln!(output, "\n{}", "=".repeat(80))?;
         writeln!(output, "VIBRATION ANALYSIS")?;
         writeln!(output, "{}", "=".repeat(80))?;
-        run_vibration_analysis(&mut output, &samples, sample_rate, range)?;
+        run_vibration_analysis(&mut output, &samples, sample_rate, metadata, range)?;
     }
 
     writeln!(output, "\n{}", "=".repeat(80))?;
@@ -171,22 +172,23 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
 #[derive(Debug)]
 struct Stats {
-    mean: f32,
-    rms: f32,
-    std_dev: f32,
-    min: f32,
-    max: f32,
-    peak_to_peak: f32,
+    mean: f64,
+    rms: f64,
+    std_dev: f64,
+    min: f64,
+    max: f64,
+    peak_to_peak: f64,
 }
 
+// Accumulate in f64: f32 sums drift by several percent over long recordings
 fn compute_stats(data: &[f32]) -> Stats {
-    let n = data.len() as f32;
-    let mean = data.iter().sum::<f32>() / n;
-    let rms = (data.iter().map(|&x| x * x).sum::<f32>() / n).sqrt();
-    let variance = data.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / n;
+    let n = data.len() as f64;
+    let mean = data.iter().map(|&x| x as f64).sum::<f64>() / n;
+    let rms = (data.iter().map(|&x| (x as f64).powi(2)).sum::<f64>() / n).sqrt();
+    let variance = data.iter().map(|&x| (x as f64 - mean).powi(2)).sum::<f64>() / n;
     let std_dev = variance.sqrt();
-    let min = data.iter().copied().fold(f32::INFINITY, f32::min);
-    let max = data.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let min = data.iter().map(|&x| x as f64).fold(f64::INFINITY, f64::min);
+    let max = data.iter().map(|&x| x as f64).fold(f64::NEG_INFINITY, f64::max);
     let peak_to_peak = max - min;
     Stats { mean, rms, std_dev, min, max, peak_to_peak }
 }
@@ -225,7 +227,9 @@ fn run_fft_analysis(output: &mut dyn Write, samples: &[TimestampedSample], sampl
     writeln!(output)?;
     writeln!(output, "FFT Parameters:")?;
     writeln!(output, "  Window size: {} samples", WINDOW_SIZE)?;
-    writeln!(output, "  Window type: Hann")?;
+    writeln!(output, "  Window type: Hann, mean removed per segment")?;
+    writeln!(output, "  Averaging: Welch, 50% overlap, {} segments over the analysis range",
+        fft_segment_count(samples.len(), WINDOW_SIZE))?;
     writeln!(output, "  Frequency resolution: {:.2} Hz", sample_rate / WINDOW_SIZE as f64)?;
     writeln!(output, "  Max frequency: {:.1} Hz", sample_rate / 2.0)?;
     writeln!(output)?;
@@ -250,7 +254,7 @@ fn run_fft_analysis(output: &mut dyn Write, samples: &[TimestampedSample], sampl
             writeln!(output, "  No significant peaks detected")?;
         } else {
             for (i, peak) in peaks.iter().take(5).enumerate() {
-                writeln!(output, "  {}. {:.2} Hz (magnitude: {:.6})",
+                writeln!(output, "  {}. {:.2} Hz (amplitude: {:.6} g)",
                     i + 1, peak.frequency_hz, peak.magnitude)?;
             }
         }
@@ -263,139 +267,63 @@ fn run_fft_analysis(output: &mut dyn Write, samples: &[TimestampedSample], sampl
 // VIBRATION
 // ============================================================================
 
-fn high_pass_filter(data: &[f32], cutoff_hz: f64, sample_rate: f64) -> Vec<f32> {
-    let rc = 1.0 / (2.0 * PI * cutoff_hz);
-    let dt = 1.0 / sample_rate;
-    let alpha = rc / (rc + dt);
+fn run_vibration_analysis(output: &mut dyn Write, samples: &[TimestampedSample], measured_rate: f64, metadata: &Metadata, range: Range) -> io::Result<()> {
+    let odr = metadata.sample_rate_hz;
+    // FIFO samples are spaced by the sensor clock; polling samples by the poll interval
+    let sample_rate = if metadata.acquisition_mode == "fifo" { odr } else { measured_rate };
+    let sensor_bandwidth = odr / 4.0; // ADXL355 digital LPF corner
+    let band = vibration_band(sample_rate, sensor_bandwidth);
 
-    let mut filtered = Vec::with_capacity(data.len());
-    let mut prev_input = data[0] as f64;
-    let mut prev_output = 0.0_f64;
+    writeln!(output)?;
+    writeln!(output, "Overall values as reported by handheld vibration meters:")?;
+    writeln!(output, "  Sample rate used: {:.1} Hz", sample_rate)?;
+    writeln!(output, "  Accel / velocity band: {:.1} - {:.1} Hz (meter: 10 - 1000 Hz)", band.low_hz, band.velocity_high_hz)?;
+    writeln!(output, "  Displacement band:     {:.1} - {:.1} Hz (meter: 10 - 500 Hz)", band.low_hz, band.displacement_high_hz)?;
+    if band.velocity_high_hz < VELOCITY_BAND_HIGH_HZ {
+        writeln!(output, "  Note: upper edge capped by ODR/4 (sensor LPF) or fs/4; vibration above {:.0} Hz is not measured,", band.velocity_high_hz)?;
+        writeln!(output, "        so readings can be lower than a 10 - 1000 Hz meter. Use a higher ODR to widen the band.")?;
+    }
+    writeln!(output, "  First {:.1}s excluded (filter settling)", SETTLE_SECONDS)?;
+    if metadata.acquisition_mode == "fifo" && measured_rate < odr * 0.97 {
+        writeln!(output, "  WARNING: ~{:.0}% of samples missing (FIFO overflow). Integration assumes no gaps,",
+            (1.0 - measured_rate / odr) * 100.0)?;
+        writeln!(output, "           so velocity and displacement are unreliable. Record at a lower ODR.")?;
+    }
+    writeln!(output)?;
 
-    for &input in data {
-        let input_f64 = input as f64;
-        let output = alpha * (prev_output + input_f64 - prev_input);
-        filtered.push(output as f32);
-        prev_input = input_f64;
-        prev_output = output;
+    let mut results = Vec::new();
+    for (axis, index) in [("X", 0), ("Y", 1), ("Z", 2)] {
+        let accel: Vec<f64> = samples.iter()
+            .map(|s| {
+                let g = s.data.accel_to_g(range);
+                [g.0, g.1, g.2][index] as f64 * STANDARD_GRAVITY
+            })
+            .collect();
+        match overall_vibration(&accel, sample_rate, sensor_bandwidth) {
+            Some(v) => results.push((axis, v)),
+            None => {
+                writeln!(output, "Insufficient data: need at least {:.1}s of samples and ODR >= 62.5 Hz",
+                    SETTLE_SECONDS + 1.0)?;
+                return Ok(());
+            }
+        }
     }
 
-    filtered
-}
-
-fn integrate_trapezoidal(data: &[f32], dt: f64) -> Vec<f32> {
-    let mut integrated = Vec::with_capacity(data.len());
-    let mut accumulator = 0.0;
-
-    integrated.push(0.0);
-
-    for i in 1..data.len() {
-        accumulator += ((data[i] + data[i - 1]) as f64 / 2.0) * dt;
-        integrated.push(accumulator as f32);
+    writeln!(output, "{:<6} {:>12} {:>12} {:>14} {:>12}", "Axis", "Accel RMS", "Accel Peak", "Velocity RMS", "Displ. P-P")?;
+    writeln!(output, "{:<6} {:>12} {:>12} {:>14} {:>12}", "", "(m/s^2)", "(m/s^2)", "(mm/s)", "(um)")?;
+    writeln!(output, "{:-<60}", "")?;
+    for (axis, v) in &results {
+        writeln!(output, "{:<6} {:>12.4} {:>12.4} {:>14.3} {:>12.2}",
+            axis, v.accel_rms, v.accel_peak, v.velocity_rms, v.displacement_pp)?;
     }
+    writeln!(output, "Peak and P-P are true extremes over the analysis window (they grow with window length).")?;
 
-    integrated
-}
-
-fn run_vibration_analysis(output: &mut dyn Write, samples: &[TimestampedSample], sample_rate: f64, range: Range) -> io::Result<()> {
-    let dt = 1.0 / sample_rate;
-
+    // A meter measures one direction at a time; report the highest axis
+    let (axis, worst) = results.iter()
+        .max_by(|a, b| a.1.velocity_rms.total_cmp(&b.1.velocity_rms))
+        .unwrap();
     writeln!(output)?;
-    writeln!(output, "Vibration Analysis Parameters:")?;
-    writeln!(output, "  Sample rate: {:.1} Hz", sample_rate)?;
-    writeln!(output, "  Time step (dt): {:.6} s", dt)?;
-    writeln!(output, "  High-pass filter cutoff: 0.5 Hz")?;
-    writeln!(output)?;
-
-    let accel_x: Vec<f32> = samples.iter().map(|s| s.data.accel_to_g(range).0).collect();
-    let accel_y: Vec<f32> = samples.iter().map(|s| s.data.accel_to_g(range).1).collect();
-    let accel_z: Vec<f32> = samples.iter().map(|s| s.data.accel_to_g(range).2).collect();
-
-    // RMS acceleration
-    let rms_x = compute_rms(&accel_x);
-    let rms_y = compute_rms(&accel_y);
-    let rms_z = compute_rms(&accel_z);
-    let rms_total = (rms_x * rms_x + rms_y * rms_y + rms_z * rms_z).sqrt();
-
-    writeln!(output, "RMS Acceleration (g):")?;
-    writeln!(output, "  X: {:.6}g", rms_x)?;
-    writeln!(output, "  Y: {:.6}g", rms_y)?;
-    writeln!(output, "  Z: {:.6}g", rms_z)?;
-    writeln!(output, "  Total: {:.6}g", rms_total)?;
-    writeln!(output)?;
-
-    // Remove DC offset (gravity) before filtering and integration
-    let n = accel_x.len() as f32;
-    let mean_x: f32 = accel_x.iter().sum::<f32>() / n;
-    let mean_y: f32 = accel_y.iter().sum::<f32>() / n;
-    let mean_z: f32 = accel_z.iter().sum::<f32>() / n;
-
-    let accel_x_ac: Vec<f32> = accel_x.iter().map(|&a| a - mean_x).collect();
-    let accel_y_ac: Vec<f32> = accel_y.iter().map(|&a| a - mean_y).collect();
-    let accel_z_ac: Vec<f32> = accel_z.iter().map(|&a| a - mean_z).collect();
-
-    // High-pass filter and integrate to velocity
-    const G_TO_MS2: f64 = 9.81;
-    let accel_x_filtered = high_pass_filter(&accel_x_ac, 0.5, sample_rate);
-    let accel_y_filtered = high_pass_filter(&accel_y_ac, 0.5, sample_rate);
-    let accel_z_filtered = high_pass_filter(&accel_z_ac, 0.5, sample_rate);
-
-    let accel_x_ms2: Vec<f32> = accel_x_filtered.iter().map(|&a| a * G_TO_MS2 as f32).collect();
-    let accel_y_ms2: Vec<f32> = accel_y_filtered.iter().map(|&a| a * G_TO_MS2 as f32).collect();
-    let accel_z_ms2: Vec<f32> = accel_z_filtered.iter().map(|&a| a * G_TO_MS2 as f32).collect();
-
-    let velocity_x = integrate_trapezoidal(&accel_x_ms2, dt);
-    let velocity_y = integrate_trapezoidal(&accel_y_ms2, dt);
-    let velocity_z = integrate_trapezoidal(&accel_z_ms2, dt);
-
-    let rms_vel_x = compute_rms(&velocity_x);
-    let rms_vel_y = compute_rms(&velocity_y);
-    let rms_vel_z = compute_rms(&velocity_z);
-    let rms_vel_total = (rms_vel_x * rms_vel_x + rms_vel_y * rms_vel_y + rms_vel_z * rms_vel_z).sqrt();
-
-    writeln!(output, "RMS Velocity (m/s):")?;
-    writeln!(output, "  X: {:.6} m/s", rms_vel_x)?;
-    writeln!(output, "  Y: {:.6} m/s", rms_vel_y)?;
-    writeln!(output, "  Z: {:.6} m/s", rms_vel_z)?;
-    writeln!(output, "  Total: {:.6} m/s", rms_vel_total)?;
-    writeln!(output)?;
-
-    // Integrate velocity to displacement
-    let displacement_x = integrate_trapezoidal(&velocity_x, dt);
-    let displacement_y = integrate_trapezoidal(&velocity_y, dt);
-    let displacement_z = integrate_trapezoidal(&velocity_z, dt);
-
-    let rms_disp_x = compute_rms(&displacement_x);
-    let rms_disp_y = compute_rms(&displacement_y);
-    let rms_disp_z = compute_rms(&displacement_z);
-    let rms_disp_total = (rms_disp_x * rms_disp_x + rms_disp_y * rms_disp_y + rms_disp_z * rms_disp_z).sqrt();
-
-    writeln!(output, "RMS Displacement (m):")?;
-    writeln!(output, "  X: {:.6} m ({:.3} mm)", rms_disp_x, rms_disp_x * 1000.0)?;
-    writeln!(output, "  Y: {:.6} m ({:.3} mm)", rms_disp_y, rms_disp_y * 1000.0)?;
-    writeln!(output, "  Z: {:.6} m ({:.3} mm)", rms_disp_z, rms_disp_z * 1000.0)?;
-    writeln!(output, "  Total: {:.6} m ({:.3} mm)", rms_disp_total, rms_disp_total * 1000.0)?;
-    writeln!(output)?;
-
-    // Peak values
-    let peak_vel_x = velocity_x.iter().copied().fold(0.0f32, |a, b| a.max(b.abs()));
-    let peak_vel_y = velocity_y.iter().copied().fold(0.0f32, |a, b| a.max(b.abs()));
-    let peak_vel_z = velocity_z.iter().copied().fold(0.0f32, |a, b| a.max(b.abs()));
-
-    let peak_disp_x = displacement_x.iter().copied().fold(0.0f32, |a, b| a.max(b.abs()));
-    let peak_disp_y = displacement_y.iter().copied().fold(0.0f32, |a, b| a.max(b.abs()));
-    let peak_disp_z = displacement_z.iter().copied().fold(0.0f32, |a, b| a.max(b.abs()));
-
-    writeln!(output, "Peak Velocity (m/s):")?;
-    writeln!(output, "  X: {:.6} m/s", peak_vel_x)?;
-    writeln!(output, "  Y: {:.6} m/s", peak_vel_y)?;
-    writeln!(output, "  Z: {:.6} m/s", peak_vel_z)?;
-    writeln!(output)?;
-
-    writeln!(output, "Peak Displacement (m):")?;
-    writeln!(output, "  X: {:.6} m ({:.3} mm)", peak_disp_x, peak_disp_x * 1000.0)?;
-    writeln!(output, "  Y: {:.6} m ({:.3} mm)", peak_disp_y, peak_disp_y * 1000.0)?;
-    writeln!(output, "  Z: {:.6} m ({:.3} mm)", peak_disp_z, peak_disp_z * 1000.0)?;
+    writeln!(output, "Overall velocity (highest axis): {:.3} mm/s RMS ({})", worst.velocity_rms, axis)?;
 
     Ok(())
 }

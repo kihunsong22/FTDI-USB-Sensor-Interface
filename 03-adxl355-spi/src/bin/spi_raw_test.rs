@@ -1,4 +1,5 @@
-//! Minimal raw SPI test - no library dependency, just FFI
+//! Minimal raw SPI test - no library dependency, just FFI.
+//! Reads DEVID_AD (expect 0xAD): command (addr << 1) | 1, then exactly 1 byte.
 
 use std::ptr;
 
@@ -17,7 +18,8 @@ extern "C" {
     fn SPI_OpenChannel(i: DWORD, h: *mut Handle) -> DWORD;
     fn SPI_InitChannel(h: Handle, c: *mut Cfg) -> DWORD;
     fn SPI_CloseChannel(h: Handle) -> DWORD;
-    fn SPI_ReadWrite(h: Handle, i: *mut UCHAR, o: *mut UCHAR, s: DWORD, x: LPDWORD, opt: DWORD) -> DWORD;
+    fn SPI_Write(h: Handle, b: *mut UCHAR, s: DWORD, x: LPDWORD, opt: DWORD) -> DWORD;
+    fn SPI_Read(h: Handle, b: *mut UCHAR, s: DWORD, x: LPDWORD, opt: DWORD) -> DWORD;
 }
 
 fn main() {
@@ -33,16 +35,16 @@ fn main() {
     let st = unsafe { SPI_InitChannel(h, &mut cfg) };
     println!("Init: {}", st);
 
-    // Read DEVID_AD with cmd=0x80
-    let mut out = [0x80u8, 0x00, 0x00];
-    let mut inp = [0u8; 3];
+    // Command byte with CS held low (0x02), then 1 byte with CS released (0x04)
+    let mut cmd = [0x01u8];
+    let mut rx = [0u8; 1];
     let mut xfer: DWORD = 0;
-    let st = unsafe { SPI_ReadWrite(h, inp.as_mut_ptr(), out.as_mut_ptr(), 3, &mut xfer, 0x06) };
-    println!("ReadWrite status={} xfer={}", st, xfer);
-    println!("RX: {:02X} {:02X} {:02X}", inp[0], inp[1], inp[2]);
+    let st_w = unsafe { SPI_Write(h, cmd.as_mut_ptr(), 1, &mut xfer, 0x02) };
+    let st_r = unsafe { SPI_Read(h, rx.as_mut_ptr(), 1, &mut xfer, 0x04) };
+    println!("Write status={} Read status={} xfer={}", st_w, st_r, xfer);
 
-    if inp[0] == 0xAD { println!("DEVID_AD = 0xAD ✓") }
-    else { println!("DEVID_AD = 0x{:02X} ✗ (expected 0xAD)", inp[0]) }
+    if rx[0] == 0xAD { println!("DEVID_AD = 0xAD ✓") }
+    else { println!("DEVID_AD = 0x{:02X} ✗ (expected 0xAD)", rx[0]) }
 
     unsafe { SPI_CloseChannel(h) };
 }

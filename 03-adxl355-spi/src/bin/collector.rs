@@ -48,6 +48,17 @@ fn rate_to_odr(rate: u32) -> OutputDataRate {
     }
 }
 
+/// Polling reads the data registers, so the ODR must be faster than the poll
+/// rate or the same sample is read twice. Presets double, so the result is at
+/// most 2x the rate, which keeps the sensor LPF (ODR/4) below the poll Nyquist.
+fn poll_rate_to_odr(rate: u32) -> OutputDataRate {
+    use OutputDataRate::*;
+    [Odr3_906, Odr7_813, Odr15_625, Odr31_25, Odr62_5, Odr125, Odr250, Odr500, Odr1000, Odr2000, Odr4000]
+        .into_iter()
+        .find(|odr| odr.as_hz() > rate as f64)
+        .unwrap_or(Odr4000)
+}
+
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
@@ -56,7 +67,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    let odr = rate_to_odr(args.rate);
+    let odr = if args.mode == "fifo" { rate_to_odr(args.rate) } else { poll_rate_to_odr(args.rate) };
     let actual_rate = odr.as_hz();
 
     println!("ADXL355 Data Collector");
@@ -295,7 +306,7 @@ fn collect_fifo(
         eprintln!("Warning: {} FIFO overflow(s) detected — some samples were lost", overflow_count);
     }
 
-    sensor.disable_fifo()?;
+    sensor.standby()?;
     writer.flush()?;
 
     Ok(())

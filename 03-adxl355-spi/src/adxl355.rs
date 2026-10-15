@@ -10,7 +10,17 @@ const REG_DEVID_AD: u8 = 0x00;
 const REG_PARTID: u8 = 0x02;
 
 // Status and FIFO
+const REG_STATUS: u8 = 0x04;
 const REG_FIFO_ENTRIES: u8 = 0x05;
+
+// STATUS.FIFO_OVR: latched when a sample is dropped because the FIFO was full,
+// cleared when STATUS is read
+const STATUS_FIFO_OVR: u8 = 0x04;
+
+// FIFO holds 96 entries = 32 XYZ samples
+const FIFO_CAPACITY_SAMPLES: usize = 32;
+const FIFO_X_MARKER: u8 = 0x01;
+const FIFO_EMPTY_MARKER: u8 = 0x02;
 
 // Temperature data (12-bit: TEMP2[3:0] = bits[11:8], TEMP1[7:0] = bits[7:0])
 const REG_TEMP2: u8 = 0x06;
@@ -137,10 +147,50 @@ fn parse_20bit(high: u8, mid: u8, low: u8) -> i32 {
     }
 }
 
+/// Parse FIFO_DATA bytes into XYZ samples. Each entry is 3 bytes; in the last
+/// byte, bit 0 marks an X-axis entry and bit 1 marks a read of an empty FIFO.
+fn parse_fifo(data: &[u8]) -> Vec<SensorData> {
+    let mut samples = Vec::with_capacity(data.len() / 9);
+    let mut i = 0;
+
+    // Align to the first X-axis entry
+    while i + 2 < data.len() && data[i + 2] & FIFO_X_MARKER == 0 {
+        if data[i + 2] & FIFO_EMPTY_MARKER != 0 {
+            return samples;
+        }
+        i += 3;
+    }
+
+    // Parse aligned XYZ triplets
+    while i + 8 < data.len() && data[i + 2] & FIFO_EMPTY_MARKER == 0 {
+        samples.push(SensorData {
+            accel_x: parse_20bit(data[i], data[i + 1], data[i + 2]),
+            accel_y: parse_20bit(data[i + 3], data[i + 4], data[i + 5]),
+            accel_z: parse_20bit(data[i + 6], data[i + 7], data[i + 8]),
+            temperature: 0,
+        });
+        i += 9;
+    }
+
+    samples
+}
+
+/// Turn an SPI_Write/SPI_Read status and byte count into a Result
+fn check_transfer(status: FT_STATUS, expected: DWORD, actual: DWORD) -> Result<()> {
+    if status != FT_OK {
+        return Err(status.into());
+    }
+    if actual != expected {
+        return Err(Adxl355Error::TransferError { expected, actual });
+    }
+    Ok(())
+}
+
 /// ADXL355 sensor interface (SPI)
 pub struct Adxl355 {
     handle: FT_HANDLE,
     range: Range,
+    odr: OutputDataRate,
     fifo_enabled: bool,
 }
 
@@ -151,6 +201,7 @@ impl Adxl355 {
         Ok(Adxl355 {
             handle,
             range: Range::G2,
+            odr: OutputDataRate::Odr4000, // FILTER register reset value
             fifo_enabled: false,
         })
     }
@@ -160,36 +211,6 @@ impl Adxl355 {
         self.read_register(reg)
     }
 
-    /// Diagnostic: raw SPI read showing all bytes including dummy
-    pub fn read_reg_debug(&mut self, reg: u8) -> Result<(Vec<u8>, Vec<u8>)> {
-        use crate::ffi::*;
-        // Send 3 bytes to see what comes back at each position
-        let mut out_buf = [(reg << 1) | 0x01, 0x00, 0x00];
-        let mut in_buf = [0u8; 3];
-        let mut transferred: DWORD = 0;
-
-        let options = SPI_TRANSFER_OPTIONS_SIZE_IN_BYTES
-            | SPI_TRANSFER_OPTIONS_CHIPSELECT_ENABLE
-            | SPI_TRANSFER_OPTIONS_CHIPSELECT_DISABLE;
-
-        let status = unsafe {
-            SPI_ReadWrite(
-                self.handle,
-                in_buf.as_mut_ptr(),
-                out_buf.as_mut_ptr(),
-                3,
-                &mut transferred,
-                options,
-            )
-        };
-
-        if status != FT_OK {
-            return Err(status.into());
-        }
-
-        Ok((out_buf.to_vec(), in_buf.to_vec()))
-    }
-
     /// Create a new ADXL355 instance over SPI
     pub fn new(channel_index: u32) -> Result<Self> {
         let handle = Self::open_channel(channel_index)?;
@@ -197,42 +218,13 @@ impl Adxl355 {
         let mut sensor = Adxl355 {
             handle,
             range: Range::G2,
+            odr: OutputDataRate::Odr1000, // set by init()
             fifo_enabled: false,
         };
 
         sensor.init()?;
 
         Ok(sensor)
-    }
-
-    /// Prime the SPI bus after channel init.
-    /// The FT232H MPSSE returns invalid data for the first few SPI
-    /// transactions. A ReadWrite + split Write/Read sequence reliably
-    /// brings the bus into a working state.
-    fn prime_spi(handle: FT_HANDLE) {
-        let opts = SPI_TRANSFER_OPTIONS_SIZE_IN_BYTES
-            | SPI_TRANSFER_OPTIONS_CHIPSELECT_ENABLE
-            | SPI_TRANSFER_OPTIONS_CHIPSELECT_DISABLE;
-        let mut xfer: DWORD = 0;
-        let mut dummy_out = [0x01u8, 0x00, 0x00];
-        let mut dummy_in = [0u8; 3];
-        unsafe {
-            SPI_ReadWrite(handle, dummy_in.as_mut_ptr(), dummy_out.as_mut_ptr(),
-                3, &mut xfer, opts);
-        }
-
-        let mut cmd = [0x01u8];
-        xfer = 0;
-        unsafe {
-            SPI_Write(handle, cmd.as_mut_ptr(), 1, &mut xfer,
-                SPI_TRANSFER_OPTIONS_SIZE_IN_BYTES | SPI_TRANSFER_OPTIONS_CHIPSELECT_ENABLE);
-        }
-        let mut rd = [0u8; 2];
-        xfer = 0;
-        unsafe {
-            SPI_Read(handle, rd.as_mut_ptr(), 2, &mut xfer,
-                SPI_TRANSFER_OPTIONS_SIZE_IN_BYTES | SPI_TRANSFER_OPTIONS_CHIPSELECT_DISABLE);
-        }
     }
 
     /// Open and configure an SPI channel
@@ -278,8 +270,6 @@ impl Adxl355 {
 
     /// Initialize the ADXL355 sensor
     fn init(&mut self) -> Result<()> {
-        Self::prime_spi(self.handle);
-
         let devid_ad = self.read_register(REG_DEVID_AD)?;
         if devid_ad != DEVID_AD_VALUE {
             return Err(Adxl355Error::InvalidDeviceId(devid_ad));
@@ -310,10 +300,12 @@ impl Adxl355 {
     //
     // FT232H MPSSE split Write+Read transport:
     //   The MPSSE SPI_Write sends the command byte (MOSI only).
-    //   SPI_Read clocks in the response (MISO only).
-    //   The ADXL355 has a 2-byte pipeline delay: the first 2 bytes
-    //   clocked in via SPI_Read are stale. Fresh register data begins
-    //   at byte index 2 of the Read buffer.
+    //   SPI_Read clocks in the response (MISO only), exactly `count` bytes.
+    //
+    //   Do not call SPI_ReadWrite: this libMPSSE build answers it with the
+    //   MPSSE bad-command reply (0xFA 0x00), leaving 2 stray bytes in the RX
+    //   queue that shift every later read. Reading extra bytes to skip them
+    //   also clocks extra bytes out of FIFO_DATA, dropping ~1 sample per read.
     // ========================================================================
 
     /// Write a single byte to a register
@@ -336,52 +328,12 @@ impl Adxl355 {
             )
         };
 
-        if status != FT_OK {
-            return Err(status.into());
-        }
-
-        Ok(())
+        check_transfer(status, 2, transferred)
     }
 
     /// Read a single byte from a register
     fn read_register(&mut self, reg: u8) -> Result<u8> {
-        let cmd = (reg << 1) | 0x01; // read command
-        let mut cmd_buf = [cmd];
-        let mut transferred: DWORD = 0;
-
-        // Write command byte (CS asserted, stays low)
-        let status = unsafe {
-            SPI_Write(
-                self.handle,
-                cmd_buf.as_mut_ptr(),
-                1,
-                &mut transferred,
-                SPI_TRANSFER_OPTIONS_SIZE_IN_BYTES
-                    | SPI_TRANSFER_OPTIONS_CHIPSELECT_ENABLE,
-            )
-        };
-        if status != FT_OK {
-            return Err(status.into());
-        }
-
-        // Read 3 bytes (2 stale pipeline + 1 fresh), then CS deasserted
-        let mut data = [0u8; 3];
-        transferred = 0;
-        let status = unsafe {
-            SPI_Read(
-                self.handle,
-                data.as_mut_ptr(),
-                3,
-                &mut transferred,
-                SPI_TRANSFER_OPTIONS_SIZE_IN_BYTES
-                    | SPI_TRANSFER_OPTIONS_CHIPSELECT_DISABLE,
-            )
-        };
-        if status != FT_OK {
-            return Err(status.into());
-        }
-
-        Ok(data[2]) // skip 2-byte pipeline delay
+        Ok(self.read_registers(reg, 1)?[0])
     }
 
     /// Read multiple bytes from consecutive registers
@@ -401,30 +353,24 @@ impl Adxl355 {
                     | SPI_TRANSFER_OPTIONS_CHIPSELECT_ENABLE,
             )
         };
-        if status != FT_OK {
-            return Err(status.into());
-        }
+        check_transfer(status, 1, transferred)?;
 
-        // Read count+2 bytes (2 stale pipeline + count fresh), then CS deasserted
-        let total = count + 2;
-        let mut data = vec![0u8; total];
+        // Read exactly count bytes, then CS deasserted
+        let mut data = vec![0u8; count];
         transferred = 0;
         let status = unsafe {
             SPI_Read(
                 self.handle,
                 data.as_mut_ptr(),
-                total as DWORD,
+                count as DWORD,
                 &mut transferred,
                 SPI_TRANSFER_OPTIONS_SIZE_IN_BYTES
                     | SPI_TRANSFER_OPTIONS_CHIPSELECT_DISABLE,
             )
         };
-        if status != FT_OK {
-            return Err(status.into());
-        }
+        check_transfer(status, count as DWORD, transferred)?;
 
-        // Skip 2-byte pipeline delay
-        Ok(data[2..].to_vec())
+        Ok(data)
     }
 
     // ========================================================================
@@ -454,6 +400,7 @@ impl Adxl355 {
         let current = self.read_register(REG_FILTER)?;
         let new_val = (current & 0xF0) | (odr as u8);
         self.write_register(REG_FILTER, new_val)?;
+        self.odr = odr;
 
         self.write_register(REG_POWER_CTL, 0x00)?;
         std::thread::sleep(Duration::from_millis(5));
@@ -463,6 +410,10 @@ impl Adxl355 {
 
     pub fn get_range(&self) -> Range {
         self.range
+    }
+
+    pub fn get_odr(&self) -> OutputDataRate {
+        self.odr
     }
 
     // ========================================================================
@@ -572,24 +523,26 @@ impl Adxl355 {
     // ========================================================================
 
     pub fn enable_fifo(&mut self, odr: OutputDataRate) -> Result<()> {
-        self.write_register(REG_POWER_CTL, POWER_CTL_STANDBY)?;
+        self.set_odr(odr)?;
         std::thread::sleep(Duration::from_millis(5));
-
-        let current_filter = self.read_register(REG_FILTER)?;
-        let new_filter = (current_filter & 0xF0) | (odr as u8);
-        self.write_register(REG_FILTER, new_filter)?;
-
-        self.write_register(REG_POWER_CTL, 0x00)?;
-        std::thread::sleep(Duration::from_millis(10));
 
         self.fifo_enabled = true;
 
-        let _ = self.read_fifo_batch();
+        // Drop samples from the switch-over and clear STATUS.FIFO_OVR. At high
+        // ODR the FIFO overflows during the sleeps above, and keeps overflowing
+        // while the first drain reads it, so repeat until the flag stays clear.
+        for _ in 0..4 {
+            if !self.read_fifo_batch_checked()?.overflow_detected {
+                break;
+            }
+        }
 
         Ok(())
     }
 
-    pub fn disable_fifo(&mut self) -> Result<()> {
+    /// Stop measurement (standby). The ADXL355 FIFO cannot be disabled on its
+    /// own; it always fills while the sensor is measuring.
+    pub fn standby(&mut self) -> Result<()> {
         self.write_register(REG_POWER_CTL, POWER_CTL_STANDBY)?;
         self.fifo_enabled = false;
         Ok(())
@@ -600,110 +553,39 @@ impl Adxl355 {
         Ok(self.read_register(REG_FIFO_ENTRIES)? & 0x7F)
     }
 
-    /// Read all available samples from the FIFO (single SPI transaction for data)
+    /// Read all available samples from the FIFO
     pub fn read_fifo_batch(&mut self) -> Result<Vec<SensorData>> {
-        let entries = self.get_fifo_entries()? as usize;
-
-        if entries < 3 {
-            return Ok(Vec::new());
-        }
-
-        let num_samples = entries / 3;
-        let bytes_to_read = num_samples * 9;
-
-        let fifo_data = self.read_registers(REG_FIFO_DATA, bytes_to_read)?;
-
-        // Parse with X-axis marker alignment (bit 0 of low byte = X marker)
-        let mut samples = Vec::with_capacity(num_samples);
-        let mut i = 0;
-
-        // Find first X-axis entry for alignment
-        while i + 2 < fifo_data.len() {
-            if fifo_data[i + 2] & 0x02 != 0 {
-                return Ok(samples);
-            }
-            if fifo_data[i + 2] & 0x01 != 0 {
-                break;
-            }
-            i += 3;
-        }
-
-        // Parse aligned XYZ triplets
-        while i + 8 < fifo_data.len() {
-            if fifo_data[i + 2] & 0x02 != 0 {
-                break;
-            }
-
-            let accel_x = parse_20bit(fifo_data[i], fifo_data[i + 1], fifo_data[i + 2]);
-            let accel_y = parse_20bit(fifo_data[i + 3], fifo_data[i + 4], fifo_data[i + 5]);
-            let accel_z = parse_20bit(fifo_data[i + 6], fifo_data[i + 7], fifo_data[i + 8]);
-
-            samples.push(SensorData {
-                accel_x,
-                accel_y,
-                accel_z,
-                temperature: 0,
-            });
-
-            i += 9;
-        }
-
-        Ok(samples)
+        Ok(self.read_fifo_batch_checked()?.samples)
     }
 
-    /// Read FIFO batch with overflow detection
+    /// Read all available samples from the FIFO, with overflow detection.
+    ///
+    /// STATUS and FIFO_ENTRIES are adjacent, so one transaction returns both;
+    /// STATUS.FIFO_OVR reports whether samples were dropped since the last read.
     pub fn read_fifo_batch_checked(&mut self) -> Result<FifoBatchResult> {
-        let entries = self.get_fifo_entries()? as usize;
+        let regs = self.read_registers(REG_STATUS, 2)?;
+        let overflow_detected = regs[0] & STATUS_FIFO_OVR != 0;
+        // Bit 7 of FIFO_ENTRIES is reserved; bits [6:0] hold the entry count (0–96)
+        let num_samples = (regs[1] & 0x7F) as usize / 3;
 
-        if entries < 3 {
-            return Ok(FifoBatchResult { samples: Vec::new(), overflow_detected: false });
-        }
-
-        let num_samples = entries / 3;
-        let bytes_to_read = num_samples * 9;
-
-        let fifo_data = self.read_registers(REG_FIFO_DATA, bytes_to_read)?;
-
-        let mut samples = Vec::with_capacity(num_samples);
-        let mut i = 0;
-        let mut overflow_detected = false;
-
-        // Find first X-axis entry for alignment
-        while i + 2 < fifo_data.len() {
-            if fifo_data[i + 2] & 0x02 != 0 {
-                overflow_detected = true;
-                return Ok(FifoBatchResult { samples, overflow_detected });
-            }
-            if fifo_data[i + 2] & 0x01 != 0 {
-                break;
-            }
-            i += 3;
-        }
-
-        // Parse aligned XYZ triplets
-        while i + 8 < fifo_data.len() {
-            if fifo_data[i + 2] & 0x02 != 0 {
-                overflow_detected = true;
-                break;
-            }
-
-            let accel_x = parse_20bit(fifo_data[i], fifo_data[i + 1], fifo_data[i + 2]);
-            let accel_y = parse_20bit(fifo_data[i + 3], fifo_data[i + 4], fifo_data[i + 5]);
-            let accel_z = parse_20bit(fifo_data[i + 6], fifo_data[i + 7], fifo_data[i + 8]);
-
-            samples.push(SensorData {
-                accel_x,
-                accel_y,
-                accel_z,
-                temperature: 0,
-            });
-
-            i += 9;
-        }
+        let samples = if num_samples == 0 {
+            Vec::new()
+        } else {
+            parse_fifo(&self.read_registers(REG_FIFO_DATA, num_samples * 9)?)
+        };
 
         Ok(FifoBatchResult { samples, overflow_detected })
     }
 
+    /// Longest FIFO poll interval at the current ODR, leaving 4x headroom before
+    /// the 32-sample FIFO fills (Windows sleeps can overshoot by a few ms)
+    pub fn max_fifo_poll_interval(&self) -> Duration {
+        Duration::from_secs_f64(FIFO_CAPACITY_SAMPLES as f64 / 4.0 / self.odr.as_hz())
+    }
+
+    /// Poll the FIFO every `batch_interval_ms` and pass each batch to `callback`.
+    /// Samples already in the FIFO are discarded; fails with `FifoOverflow` if
+    /// samples are dropped while streaming.
     pub fn stream_fifo<F>(&mut self, batch_interval_ms: u64, mut callback: F) -> Result<u64>
     where
         F: FnMut(&[SensorData]) -> StreamControl,
@@ -714,19 +596,26 @@ impl Adxl355 {
             ));
         }
 
-        if batch_interval_ms < 10 || batch_interval_ms > 1000 {
+        let max_ms = (self.max_fifo_poll_interval().as_millis() as u64).max(1);
+        if batch_interval_ms == 0 || batch_interval_ms > max_ms {
             return Err(Adxl355Error::InvalidParameter(format!(
-                "Batch interval must be 10-1000 ms, got {}",
-                batch_interval_ms
+                "Batch interval must be 1-{} ms at {} Hz ODR (FIFO holds {} samples), got {}",
+                max_ms, self.odr.as_hz(), FIFO_CAPACITY_SAMPLES, batch_interval_ms
             )));
         }
+
+        self.read_fifo_batch_checked()?;
 
         let interval = Duration::from_millis(batch_interval_ms);
         let mut total_samples = 0u64;
         let mut next_read_time = Instant::now();
 
         loop {
-            let batch = self.read_fifo_batch()?;
+            let result = self.read_fifo_batch_checked()?;
+            if result.overflow_detected {
+                return Err(Adxl355Error::FifoOverflow);
+            }
+            let batch = result.samples;
 
             if !batch.is_empty() {
                 total_samples += batch.len() as u64;
@@ -747,13 +636,14 @@ impl Adxl355 {
     }
 
     pub fn collect_samples_fifo(&mut self, odr: OutputDataRate, num_samples: usize) -> Result<Vec<SensorData>> {
-        if !self.fifo_enabled {
+        if !self.fifo_enabled || self.odr != odr {
             self.enable_fifo(odr)?;
         }
 
         let mut samples = Vec::with_capacity(num_samples);
+        let interval_ms = (self.max_fifo_poll_interval().as_millis() as u64).max(1);
 
-        self.stream_fifo(50, |batch| {
+        self.stream_fifo(interval_ms, |batch| {
             samples.extend_from_slice(batch);
 
             if samples.len() >= num_samples {
@@ -776,5 +666,39 @@ impl Drop for Adxl355 {
         unsafe {
             SPI_CloseChannel(self.handle);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Encode a 20-bit value as a FIFO/data-register entry with marker bits
+    fn entry(value: i32, markers: u8) -> [u8; 3] {
+        let raw = (value as u32) & 0xFFFFF;
+        [(raw >> 12) as u8, (raw >> 4) as u8, ((raw << 4) as u8) | markers]
+    }
+
+    #[test]
+    fn parse_20bit_sign_extends() {
+        for v in [0, 1, -1, 256_000, -256_000, 524_287, -524_288] {
+            let e = entry(v, 0);
+            assert_eq!(parse_20bit(e[0], e[1], e[2]), v);
+        }
+    }
+
+    #[test]
+    fn parse_fifo_aligns_to_x_and_stops_at_empty() {
+        let mut data = Vec::new();
+        data.extend(entry(5, 0)); // trailing Z entry before the first X
+        data.extend(entry(1, FIFO_X_MARKER));
+        data.extend(entry(-2, 0));
+        data.extend(entry(3, 0));
+        data.extend(entry(0, FIFO_EMPTY_MARKER));
+        data.extend(entry(0, 0));
+        data.extend(entry(0, 0));
+        let samples = parse_fifo(&data);
+        assert_eq!(samples.len(), 1);
+        assert_eq!((samples[0].accel_x, samples[0].accel_y, samples[0].accel_z), (1, -2, 3));
     }
 }

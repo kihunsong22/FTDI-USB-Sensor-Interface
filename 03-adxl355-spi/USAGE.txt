@@ -7,10 +7,17 @@ All commands use: cargo run --bin <name> [--features analysis] -- [options]
 1. adxl355-spi-reader (default)
 -------------------------------
 Live display with accelerometer bars, temperature, and sample rate.
-Optional RMS/FFT overlay with --features analysis.
+With --features analysis: RMS/FFT overlay plus live meter-style vibration
+(velocity RMS mm/s, accel peak, displacement P-P, highest-axis velocity) over
+a rolling 1 s window, refreshed every 0.1 s. First values after ~2 s (settling).
+
+Options:
+      --odr <HZ>           4000, 2000, 1000, 500, 250, 125 (default: 4000)
+                           Vibration band is 10 Hz to ODR/4 (max 1000 Hz)
 
   cargo run
   cargo run --features analysis
+  cargo run --features analysis -- --odr 2000
 
 
 2. collector
@@ -24,7 +31,9 @@ Options:
   -o, --output <FILE>      Output path (default: sensor_data.h5)
 
 FIFO mode is faster and more reliable than polling for high rates.
-Rate maps to nearest ODR preset: 4000, 2000, 1000, 500, 250, 125, 62.5, 31.25 Hz
+FIFO: rate maps to nearest ODR preset: 4000, 2000, 1000, 500, 250, 125, 62.5, 31.25 Hz
+Polling: ODR is the next preset above the rate (e.g. 100 -> 125, 180 -> 250), so no
+sample is read twice. FIFO overflows are reported at the end of collection.
 
 Examples:
   cargo run --bin collector -- --mode fifo --rate 1000 --duration 10
@@ -40,8 +49,10 @@ Analyze recorded HDF5 files. Requires --features analysis.
 Options:
   -i, --input <FILE>       Input HDF5 file (required)
       --statistics         Mean, RMS, std dev, min/max, peak-to-peak
-      --fft                Frequency peak detection (needs 2048+ samples)
-      --vibration          RMS acceleration, velocity, displacement
+      --fft                Frequency peaks, Welch-averaged over the analysis range
+                           (needs 2048+ samples)
+      --vibration          Handheld-meter style values: accel RMS/peak, velocity RMS (mm/s),
+                           displacement P-P. Band 10-1000 Hz, capped at ODR/4
       --all                Run all analyses (default if none specified)
       --start <SECS>       Start of analysis window
       --end <SECS>         End of analysis window
@@ -64,7 +75,8 @@ physical plausibility, sustained rate, temperature.
 
 5. spi-diag
 -----------
-Test SPI transport methods and command formats.
+Raw libMPSSE register reads (DEVID, PARTID, RANGE, burst) with exact-length
+split Write+Read; checks no stray bytes are left in the FTDI RX queue.
 
   cargo run --bin spi-diag
 
