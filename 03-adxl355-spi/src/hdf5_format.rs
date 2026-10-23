@@ -21,6 +21,19 @@ pub struct Metadata {
     pub sensor_type: String,
     pub range: String,
     pub version: String,
+    /// Wall-clock time (RFC 3339) of `timestamps` = 0. Missing in files
+    /// recorded before it was added; `start_time` is then up to ~0.1 s earlier.
+    pub timestamps_origin: Option<String>,
+}
+
+impl Metadata {
+    /// Best available wall-clock time of `timestamps` = 0, and which attribute it came from
+    pub fn time_origin(&self) -> (&str, &'static str) {
+        match &self.timestamps_origin {
+            Some(origin) => (origin, "timestamps_origin"),
+            None => (&self.start_time, "start_time"),
+        }
+    }
 }
 
 /// Handles for HDF5 datasets
@@ -154,6 +167,18 @@ impl Hdf5Writer {
         Ok(())
     }
 
+    /// Record the wall-clock time of `timestamps` = 0 (call once, when the
+    /// clock the timestamps are measured from starts)
+    pub fn set_time_origin(&self, origin: &chrono::DateTime<chrono::Local>) -> Result<()> {
+        let group = self.file.group("metadata")
+            .map_err(|e| Adxl355Error::CommunicationError(format!("Failed to open metadata group: {}", e)))?;
+        let value: hdf5::types::VarLenUnicode = origin.to_rfc3339().parse().unwrap();
+        group.new_attr::<hdf5::types::VarLenUnicode>()
+            .create("timestamps_origin")
+            .and_then(|attr| attr.write_scalar(&value))
+            .map_err(|e| Adxl355Error::CommunicationError(format!("Failed to write timestamps_origin: {}", e)))
+    }
+
     pub fn sample_count(&self) -> usize {
         self.sample_count
     }
@@ -218,6 +243,8 @@ impl Hdf5Reader {
             .and_then(|attr| attr.read_scalar::<f64>())
             .map_err(|e| Adxl355Error::CommunicationError(format!("Failed to read sample_rate_hz: {}", e)))?;
 
+        let timestamps_origin = read_str("timestamps_origin").ok();
+
         Ok(Metadata {
             start_time,
             sample_rate_hz,
@@ -225,6 +252,7 @@ impl Hdf5Reader {
             sensor_type,
             range,
             version,
+            timestamps_origin,
         })
     }
 
@@ -289,5 +317,28 @@ impl Hdf5Reader {
         }
         let start = total.saturating_sub(count);
         self.read_range(start, count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn time_origin_round_trip() {
+        let path = std::env::temp_dir().join(format!("adxl355_origin_test_{}.h5", std::process::id()));
+        let origin;
+        {
+            let mut writer = Hdf5Writer::create(&path, "fifo", 4000.0, "8g").unwrap();
+            // as in the recorders: the timestamp clock starts after the file is created
+            origin = chrono::Local::now();
+            writer.set_time_origin(&origin).unwrap();
+            writer.flush().unwrap();
+        }
+        let meta = Hdf5Reader::open(&path).unwrap().metadata().clone();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(meta.time_origin(), (origin.to_rfc3339().as_str(), "timestamps_origin"));
+        let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap();
+        assert!(parse(&meta.start_time) <= parse(meta.timestamps_origin.as_deref().unwrap()));
     }
 }

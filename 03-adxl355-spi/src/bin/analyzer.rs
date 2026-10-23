@@ -132,6 +132,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     writeln!(output, "  Configured ODR: {:.1} Hz", metadata.sample_rate_hz)?;
     writeln!(output, "  Measured sample rate: {:.1} Hz", sample_rate)?;
     writeln!(output, "  Start time: {}", metadata.start_time)?;
+    let (origin, source) = metadata.time_origin();
+    writeln!(output, "  Timestamps origin: {} ({})", origin, source)?;
     writeln!(output)?;
     writeln!(output, "Analysis Range:")?;
     writeln!(output, "  Start: {:.2}s", start_time)?;
@@ -213,6 +215,14 @@ fn run_statistics_analysis(output: &mut dyn Write, samples: &[TimestampedSample]
         writeln!(output, "{:<10} {:>12.6} {:>12.6} {:>12.6} {:>12.6} {:>12.6} {:>12.6}",
             axis, stats.mean, stats.rms, stats.std_dev, stats.min, stats.max, stats.peak_to_peak)?;
     }
+
+    // Samples pinned at the 20-bit full-scale code are clipped (range too small)
+    let clipped = |raw: fn(&TimestampedSample) -> i32| {
+        samples.iter().filter(|s| { let v = raw(s); v >= 524_287 || v <= -524_288 }).count()
+    };
+    let (cx, cy, cz) = (clipped(|s| s.data.accel_x), clipped(|s| s.data.accel_y), clipped(|s| s.data.accel_z));
+    writeln!(output, "Clipped samples (at full scale): X {}, Y {}, Z {} of {} ({:.4}% max)",
+        cx, cy, cz, samples.len(), cx.max(cy).max(cz) as f64 / samples.len() as f64 * 100.0)?;
 
     Ok(())
 }

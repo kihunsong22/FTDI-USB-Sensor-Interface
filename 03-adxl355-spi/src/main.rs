@@ -4,13 +4,17 @@
 //! FIFO polling runs on its own thread; display updates at ~120 Hz.
 
 use clap::Parser;
-use ft232_adxl355_spi::{Adxl355, Adxl355Error, FifoBatchResult, OutputDataRate, Range, create_bar};
+use ft232_adxl355_spi::{
+    Adxl355, Adxl355Error, FifoBatchResult, Hdf5Writer, OutputDataRate, Range, SensorData,
+    TimestampedSample, create_bar,
+};
 #[cfg(feature = "analysis")]
 use ft232_adxl355_spi::analysis::{
     compute_rms, find_frequency_peaks, FrequencyPeak, OverallVibration,
     VibrationMeter, STANDARD_GRAVITY,
 };
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -26,9 +30,46 @@ const VIB_WINDOW_SECONDS: f64 = 1.0;
 
 /// Messages from the acquisition thread
 enum Acquired {
-    Batch(FifoBatchResult),
+    /// FIFO batch and the time it was read (seconds since start)
+    Batch(FifoBatchResult, f64),
     Temperature(u16),
     Error(String),
+}
+
+/// Writes every sample to HDF5 (--output), with the latest temperature reading
+struct Recorder {
+    path: PathBuf,
+    writer: Hdf5Writer,
+    buffer: Vec<TimestampedSample>,
+    dt: f64,
+    last_flush: Instant,
+}
+
+impl Recorder {
+    fn push(&mut self, batch: &[SensorData], batch_time: f64, temperature: u16) -> ft232_adxl355_spi::Result<()> {
+        let n = batch.len();
+        for (i, data) in batch.iter().enumerate() {
+            let timestamp = (batch_time - (n - 1 - i) as f64 * self.dt).max(0.0);
+            self.buffer.push(TimestampedSample { timestamp, data: SensorData { temperature, ..*data } });
+        }
+        // Write in larger batches to avoid per-call resize overhead
+        if self.buffer.len() >= 200 {
+            self.writer.append_batch(&self.buffer)?;
+            self.buffer.clear();
+            if self.last_flush.elapsed() >= Duration::from_secs(10) {
+                self.writer.flush()?;
+                self.last_flush = Instant::now();
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> ft232_adxl355_spi::Result<usize> {
+        self.writer.append_batch(&self.buffer)?;
+        self.buffer.clear();
+        self.writer.flush()?;
+        Ok(self.writer.sample_count())
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -38,6 +79,18 @@ struct Args {
     /// Output data rate in Hz: 4000, 2000, 1000, 500, 250 or 125
     #[arg(long, default_value_t = 4000)]
     odr: u32,
+
+    /// Measurement range in g: 2, 4 or 8
+    #[arg(long, default_value_t = 2)]
+    range: u32,
+
+    /// Also record every sample to this HDF5 file
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// Stop after this many seconds (default: until Enter or Ctrl+C)
+    #[arg(short, long)]
+    duration: Option<u64>,
 }
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -55,10 +108,28 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         }
     };
     let odr_hz = odr.as_hz();
+    let range = match Range::from_g(args.range) {
+        Some(range) => range,
+        None => {
+            eprintln!("Error: unsupported range {} (use 2, 4 or 8)", args.range);
+            std::process::exit(1);
+        }
+    };
 
     println!("ADXL355 Sensor Reader");
     println!("=====================");
     println!("Initializing FT232H SPI interface...");
+
+    let mut recorder = match &args.output {
+        Some(path) => Some(Recorder {
+            path: path.clone(),
+            writer: Hdf5Writer::create(path, "fifo", odr_hz, &format!("{}g", args.range))?,
+            buffer: Vec::with_capacity(256),
+            dt: 1.0 / odr_hz,
+            last_flush: Instant::now(),
+        }),
+        None => None,
+    };
 
     // Ctrl+C handler
     let running = Arc::new(AtomicBool::new(true));
@@ -67,18 +138,32 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         r.store(false, Ordering::SeqCst);
     })?;
 
+    // Enter also stops; EOF (no console attached) is ignored
+    let r = running.clone();
+    thread::spawn(move || {
+        let mut line = String::new();
+        if matches!(io::stdin().read_line(&mut line), Ok(n) if n > 0) {
+            r.store(false, Ordering::SeqCst);
+        }
+    });
+
     // FIFO polling runs on its own thread so display and analysis work can't
     // stall it: at 4 kHz the 32-sample FIFO overflows after 8 ms
+    let clock = Instant::now();
+    if let Some(rec) = &recorder {
+        rec.writer.set_time_origin(&chrono::Local::now())?;
+    }
     let (init_tx, init_rx) = mpsc::channel();
     let (tx, rx) = mpsc::channel();
     let acquisition = {
         let running = running.clone();
-        thread::spawn(move || acquire(odr, running, init_tx, tx))
+        thread::spawn(move || acquire(odr, range, clock, running, init_tx, tx))
     };
 
     let range = match init_rx.recv() {
         Ok(Ok(range)) => {
-            println!("Sensor initialized, FIFO enabled at {} Hz. Press Ctrl+C to exit\n", odr_hz);
+            println!("Sensor initialized, FIFO enabled at {} Hz, range +/-{} g. Press Enter or Ctrl+C to stop\n",
+                odr_hz, args.range);
             range
         }
         Ok(Err(Adxl355Error::NoChannelsFound)) => {
@@ -139,8 +224,12 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let display_interval = Duration::from_millis(8); // ~120 Hz display
     let mut next_display = Instant::now() + display_interval;
+    let end_time = args.duration.map(|d| start_time + Duration::from_secs(d));
 
     while running.load(Ordering::SeqCst) {
+        if end_time.is_some_and(|end| Instant::now() >= end) {
+            break;
+        }
         // Handle everything the acquisition thread delivered, waiting at most
         // until the next display refresh
         let first = match rx.recv_timeout(next_display.saturating_duration_since(Instant::now())) {
@@ -149,8 +238,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         for message in first.into_iter().chain(rx.try_iter()) {
-            let result = match message {
-                Acquired::Batch(result) => result,
+            let (result, batch_time) = match message {
+                Acquired::Batch(result, batch_time) => (result, batch_time),
                 Acquired::Temperature(raw) => {
                     temperature = Some(raw);
                     continue;
@@ -168,6 +257,12 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 vib_meter.reset();
             }
             let batch = result.samples;
+            if let Some(rec) = recorder.as_mut() {
+                if let Err(e) = rec.push(&batch, batch_time, temperature.unwrap_or(0)) {
+                    eprintln!("Write error: {}", e);
+                    running.store(false, Ordering::SeqCst);
+                }
+            }
             total_samples += batch.len() as u64;
             last_batch_size = batch.len();
             let data = batch.last().unwrap();
@@ -247,11 +342,16 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             println!("{}", pad(format!("Time: {:.2}s | Samples: {} | Rate: {:.0} Hz | Batch: {} | Overflows: {}",
                 elapsed, total_samples, sample_rate, last_batch_size, fifo_overflows)));
             println!("{}", pad(format!("Temperature: {}", temp_str)));
+            match &recorder {
+                Some(rec) => println!("{}", pad(format!("Recording: {}", rec.path.display()))),
+                None => println!("{}", pad("Recording: off".into())),
+            }
             println!();
-            println!("ACCELEROMETER (g)  [-2g ◄─────────────────┼─────────────────► +2g]");
-            println!("  X: {:8.5}g  [{}]", last_ax, create_bar(last_ax, 2.0, 40));
-            println!("  Y: {:8.5}g  [{}]", last_ay, create_bar(last_ay, 2.0, 40));
-            println!("  Z: {:8.5}g  [{}]", last_az, create_bar(last_az, 2.0, 40));
+            let full_scale = range.full_scale_g();
+            println!("ACCELEROMETER (g)  [-{0}g ◄─────────────────┼─────────────────► +{0}g]", full_scale);
+            println!("  X: {:8.5}g  [{}]", last_ax, create_bar(last_ax, full_scale, 40));
+            println!("  Y: {:8.5}g  [{}]", last_ay, create_bar(last_ay, full_scale, 40));
+            println!("  Z: {:8.5}g  [{}]", last_az, create_bar(last_az, full_scale, 40));
 
             #[cfg(feature = "analysis")]
             {
@@ -314,15 +414,39 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             }
 
             println!();
-            println!("{}", pad("Press Ctrl+C to exit".into()));
+            println!("{}", pad("Press Enter or Ctrl+C to stop".into()));
             let _ = io::stdout().flush();
         }
     }
 
     println!("\nShutting down...");
     running.store(false, Ordering::SeqCst);
-    drop(rx);
     let _ = acquisition.join();
+
+    if let Some(mut rec) = recorder {
+        // Samples read before the acquisition thread stopped
+        for message in rx.try_iter() {
+            match message {
+                Acquired::Batch(result, batch_time) => {
+                    if result.overflow_detected {
+                        fifo_overflows += 1;
+                    }
+                    rec.push(&result.samples, batch_time, temperature.unwrap_or(0))?;
+                }
+                Acquired::Temperature(raw) => temperature = Some(raw),
+                Acquired::Error(_) => {}
+            }
+        }
+        let samples = rec.finish()?;
+        let elapsed = start_time.elapsed().as_secs_f64();
+        println!("\nRecording complete!");
+        println!("Total samples: {}", samples);
+        println!("Elapsed time: {:.2} seconds", elapsed);
+        println!("File: {}", rec.path.display());
+    }
+    if fifo_overflows > 0 {
+        eprintln!("Warning: {} FIFO overflow(s) detected — some samples were lost", fifo_overflows);
+    }
     Ok(())
 }
 
@@ -330,6 +454,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 /// the temperature (not in the FIFO) once per second
 fn acquire(
     odr: OutputDataRate,
+    range: Range,
+    clock: Instant,
     running: Arc<AtomicBool>,
     init: mpsc::Sender<Result<Range, Adxl355Error>>,
     out: mpsc::Sender<Acquired>,
@@ -341,18 +467,31 @@ fn acquire(
             return;
         }
     };
+    if let Err(e) = sensor.set_range(range) {
+        let _ = init.send(Err(e));
+        return;
+    }
     if let Err(e) = sensor.enable_fifo(odr) {
         let _ = init.send(Err(e));
         return;
     }
     let _ = init.send(Ok(sensor.get_range()));
 
+    ft232_adxl355_spi::prioritize_polling();
+
+    // When the FIFO is empty, wait for ~10 samples instead of re-polling at once
+    // (same as the collector; back-to-back polling dropped samples)
+    let poll_sleep = Duration::from_secs_f64(10.0 / odr.as_hz()).max(Duration::from_millis(1));
+
     let mut last_temperature: Option<Instant> = None;
     while running.load(Ordering::SeqCst) {
         let message = match sensor.read_fifo_batch_checked() {
             // An overflow always comes with a full FIFO (read in the same transaction)
-            Ok(result) if result.samples.is_empty() => None,
-            Ok(result) => Some(Acquired::Batch(result)),
+            Ok(result) if result.samples.is_empty() => {
+                thread::sleep(poll_sleep);
+                None
+            }
+            Ok(result) => Some(Acquired::Batch(result, clock.elapsed().as_secs_f64())),
             Err(e) => Some(Acquired::Error(e.to_string())),
         };
         if let Some(message) = message {

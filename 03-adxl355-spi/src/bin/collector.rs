@@ -4,11 +4,11 @@
 
 use clap::Parser;
 use ft232_adxl355_spi::{
-    Adxl355, Hdf5Writer, OutputDataRate, StreamControl, TimeKeeper, TimestampedSample,
+    Adxl355, Hdf5Writer, OutputDataRate, Range, SensorData, StreamControl, TimeKeeper, TimestampedSample,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 
 #[derive(Parser, Debug)]
 #[command(name = "collector")]
@@ -26,9 +26,13 @@ struct Args {
     #[arg(short, long, default_value = "100")]
     rate: u32,
 
-    /// Duration in seconds (optional, runs until Ctrl+C if omitted)
+    /// Duration in seconds (optional, runs until Enter or Ctrl+C if omitted)
     #[arg(short, long)]
     duration: Option<u64>,
+
+    /// Measurement range in g: 2, 4 or 8
+    #[arg(long, default_value_t = 2)]
+    range: u32,
 }
 
 /// Map a rate to the nearest ODR preset
@@ -67,31 +71,41 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    let odr = if args.mode == "fifo" { rate_to_odr(args.rate) } else { poll_rate_to_odr(args.rate) };
+    let range = match Range::from_g(args.range) {
+        Some(range) => range,
+        None => {
+            eprintln!("Error: range must be 2, 4 or 8");
+            std::process::exit(1);
+        }
+    };
+
+    let odr =if args.mode == "fifo" { rate_to_odr(args.rate) } else { poll_rate_to_odr(args.rate) };
     let actual_rate = odr.as_hz();
 
     println!("ADXL355 Data Collector");
     println!("======================");
     println!("Mode: {}", args.mode);
     println!("Target rate: {} Hz (actual ODR: {} Hz)", args.rate, actual_rate);
+    println!("Range: +/-{} g", args.range);
     println!("Output file: {}", args.output.display());
     if let Some(duration) = args.duration {
         println!("Duration: {} seconds", duration);
     } else {
-        println!("Duration: continuous (Ctrl+C to stop)");
+        println!("Duration: continuous (Enter or Ctrl+C to stop)");
     }
     println!();
 
     println!("Initializing sensor...");
     let mut sensor = Adxl355::new(0)?;
     sensor.set_odr(odr)?;
+    sensor.set_range(range)?;
     println!("Sensor initialized!\n");
 
     println!("Creating HDF5 file...");
     let range_str = match sensor.get_range() {
-        ft232_adxl355_spi::Range::G2 => "2g",
-        ft232_adxl355_spi::Range::G4 => "4g",
-        ft232_adxl355_spi::Range::G8 => "8g",
+        Range::G2 => "2g",
+        Range::G4 => "4g",
+        Range::G8 => "8g",
     };
     let mut writer = Hdf5Writer::create(
         &args.output,
@@ -109,11 +123,21 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         r.store(false, Ordering::SeqCst);
     })?;
 
+    // Enter also stops collection; EOF (no console attached) is ignored
+    let r = running.clone();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        if matches!(std::io::stdin().read_line(&mut line), Ok(n) if n > 0) {
+            println!("\nReceived Enter, stopping collection...");
+            r.store(false, Ordering::SeqCst);
+        }
+    });
+
     let collection_start = std::time::Instant::now();
     let end_time = args.duration.map(|d| collection_start + std::time::Duration::from_secs(d));
 
     println!("Starting data collection...");
-    println!("Press Ctrl+C to stop\n");
+    println!("Press Enter or Ctrl+C to stop\n");
 
     let result = if args.mode == "fifo" {
         collect_fifo(&mut sensor, &mut writer, odr, running.clone(), end_time)
@@ -154,6 +178,7 @@ fn collect_polling(
     end_time: Option<std::time::Instant>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let timer = TimeKeeper::new();
+    writer.set_time_origin(&chrono::Local::now())?;
     let mut sample_buffer = Vec::with_capacity(100);
     let mut last_flush = std::time::Instant::now();
     let mut last_progress = std::time::Instant::now();
@@ -224,13 +249,13 @@ fn collect_fifo(
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     sensor.enable_fifo(odr)?;
     println!("FIFO mode enabled (ODR: {} Hz)", odr.as_hz());
+    // This thread polls the FIFO; the writer thread spawned below keeps normal priority
+    ft232_adxl355_spi::prioritize_polling();
 
     let timer = TimeKeeper::new();
-    let mut last_flush = std::time::Instant::now();
-    let mut last_progress = std::time::Instant::now();
+    writer.set_time_origin(&chrono::Local::now())?;
     let sample_rate = odr.as_hz();
     let dt = 1.0 / sample_rate;
-    let mut total_samples: u64 = 0;
     let mut overflow_count: u64 = 0;
     let mut write_buffer: Vec<TimestampedSample> = Vec::with_capacity(256);
 
@@ -240,66 +265,92 @@ fn collect_fifo(
         ((10.0 / sample_rate) * 1_000_000.0) as u64
     ).max(std::time::Duration::from_millis(1));
 
-    loop {
-        if !running.load(Ordering::SeqCst) {
-            break;
-        }
-        if let Some(end) = end_time {
-            if std::time::Instant::now() >= end {
-                break;
-            }
-        }
+    // HDF5 writes, flushes and console output run on their own thread: at 4 kHz the
+    // 32-sample FIFO overflows after 8 ms, so the polling loop must never wait on them
+    let (tx, rx) = mpsc::channel::<Vec<TimestampedSample>>();
+    let writer_ref = &mut *writer;
+    let polled = std::thread::scope(|scope| {
+        let writer_thread = scope.spawn(move || -> ft232_adxl355_spi::Result<()> {
+            let mut last_flush = std::time::Instant::now();
+            let mut last_progress = std::time::Instant::now();
+            let mut total_samples: u64 = 0;
+            for batch in rx {
+                writer_ref.append_batch(&batch)?;
+                total_samples += batch.len() as u64;
 
-        let result = sensor.read_fifo_batch_checked()?;
-        if result.overflow_detected {
-            overflow_count += 1;
-        }
-        let batch = result.samples;
-
-        if batch.is_empty() {
-            std::thread::sleep(poll_sleep);
-            continue;
-        }
-
-        let batch_end_time = timer.elapsed_secs();
-        let batch_size = batch.len();
-
-        for (i, data) in batch.iter().enumerate() {
-            let timestamp = (batch_end_time - (batch_size - 1 - i) as f64 * dt).max(0.0);
-            write_buffer.push(TimestampedSample { timestamp, data: *data });
-        }
-
-        total_samples += batch_size as u64;
-
-        // Write to HDF5 in larger batches to avoid per-call resize overhead
-        if write_buffer.len() >= 200 {
-            if let Err(e) = writer.append_batch(&write_buffer) {
-                eprintln!("Write error: {}", e);
-                break;
-            }
-            write_buffer.clear();
-
-            if last_flush.elapsed() >= std::time::Duration::from_secs(10) {
-                if let Err(e) = writer.flush() {
-                    eprintln!("Flush error: {}", e);
+                if last_flush.elapsed() >= std::time::Duration::from_secs(10) {
+                    writer_ref.flush()?;
+                    last_flush = std::time::Instant::now();
                 }
-                last_flush = std::time::Instant::now();
+
+                if last_progress.elapsed() >= std::time::Duration::from_millis(100) {
+                    if let Some(last) = batch.last() {
+                        eprint!("\r  Collected {} samples in {:.1}s ({:.0} Hz) | Sensor temp: {:.1} C    ",
+                            total_samples, last.timestamp, total_samples as f64 / last.timestamp.max(1e-9),
+                            last.data.temperature_c());
+                    }
+                    last_progress = std::time::Instant::now();
+                }
             }
-        }
+            Ok(())
+        });
 
-        if last_progress.elapsed() >= std::time::Duration::from_secs(2) {
-            let elapsed = timer.elapsed_secs();
-            let rate = total_samples as f64 / elapsed;
-            eprint!("\r  Collected {} samples in {:.1}s ({:.0} Hz)    ",
-                total_samples, elapsed, rate);
-            last_progress = std::time::Instant::now();
-        }
-    }
+        let polled = (|| -> ft232_adxl355_spi::Result<()> {
+            // The temperature is not in the FIFO: read it once per second and
+            // store the latest reading with every sample
+            let mut temperature: u16 = 0;
+            let mut last_temperature: Option<std::time::Instant> = None;
+            loop {
+                if !running.load(Ordering::SeqCst) {
+                    break;
+                }
+                if let Some(end) = end_time {
+                    if std::time::Instant::now() >= end {
+                        break;
+                    }
+                }
 
-    // Flush remaining buffered samples
-    if !write_buffer.is_empty() {
-        writer.append_batch(&write_buffer)?;
-    }
+                if last_temperature.map_or(true, |t| t.elapsed() >= std::time::Duration::from_secs(1)) {
+                    temperature = sensor.read_temperature()?;
+                    last_temperature = Some(std::time::Instant::now());
+                }
+
+                let result = sensor.read_fifo_batch_checked()?;
+                if result.overflow_detected {
+                    overflow_count += 1;
+                }
+                let batch = result.samples;
+
+                if batch.is_empty() {
+                    std::thread::sleep(poll_sleep);
+                    continue;
+                }
+
+                let batch_end_time = timer.elapsed_secs();
+                let batch_size = batch.len();
+
+                for (i, data) in batch.iter().enumerate() {
+                    let timestamp = (batch_end_time - (batch_size - 1 - i) as f64 * dt).max(0.0);
+                    write_buffer.push(TimestampedSample { timestamp, data: SensorData { temperature, ..*data } });
+                }
+
+                // Hand over in larger batches to avoid per-call resize overhead.
+                // A send error means the writer thread stopped; its error is reported below.
+                if write_buffer.len() >= 200 && tx.send(std::mem::take(&mut write_buffer)).is_err() {
+                    break;
+                }
+            }
+            Ok(())
+        })();
+
+        // Hand over remaining buffered samples, then let the writer finish
+        if !write_buffer.is_empty() {
+            let _ = tx.send(std::mem::take(&mut write_buffer));
+        }
+        drop(tx);
+        let written = writer_thread.join().expect("HDF5 writer thread panicked");
+        polled.and(written)
+    });
 
     eprintln!();
     if overflow_count > 0 {
@@ -307,6 +358,7 @@ fn collect_fifo(
     }
 
     sensor.standby()?;
+    polled?;
     writer.flush()?;
 
     Ok(())

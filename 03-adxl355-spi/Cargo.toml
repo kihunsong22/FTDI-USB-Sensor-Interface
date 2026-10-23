@@ -22,6 +22,16 @@ path = "src/bin/analyzer.rs"
 required-features = ["analysis"]
 
 [[bin]]
+name = "engine-metrics"
+path = "src/bin/engine_metrics.rs"
+required-features = ["analysis"]
+
+[[bin]]
+name = "metrics-compare"
+path = "src/bin/metrics_compare.rs"
+required-features = ["analysis"]
+
+[[bin]]
 name = "spi-diag"
 path = "src/bin/spi_diag.rs"
 

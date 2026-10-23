@@ -158,6 +158,19 @@ pub fn overall_vibration(accel_ms2: &[f64], sample_rate: f64, sensor_bandwidth_h
     Some(summarize(accel_ms2.iter().map(|&a| chain.process(a)).skip(skip)))
 }
 
+/// Band-limited acceleration (same band and filters as `overall_vibration`),
+/// after the first SETTLE_SECONDS. Input and output in m/s^2.
+pub fn band_limited_accel(accel_ms2: &[f64], sample_rate: f64, sensor_bandwidth_hz: f64) -> Option<Vec<f64>> {
+    let band = vibration_band(sample_rate, sensor_bandwidth_hz);
+    let skip = (SETTLE_SECONDS * sample_rate) as usize;
+    if band.velocity_high_hz <= band.low_hz || accel_ms2.len() < skip + sample_rate as usize {
+        return None;
+    }
+
+    let mut chain = AxisChain::new(sample_rate, sensor_bandwidth_hz);
+    Some(accel_ms2.iter().map(|&a| chain.process(a).0).skip(skip).collect())
+}
+
 /// Streaming overall values for live display. Every sample runs through the
 /// filter chain; statistics cover a rolling window of the most recent samples.
 pub struct VibrationMeter {

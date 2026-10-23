@@ -14,10 +14,14 @@ a rolling 1 s window, refreshed every 0.1 s. First values after ~2 s (settling).
 Options:
       --odr <HZ>           4000, 2000, 1000, 500, 250, 125 (default: 4000)
                            Vibration band is 10 Hz to ODR/4 (max 1000 Hz)
+      --range <G>          2, 4, 8 (default: 2)
+  -o, --output <FILE>      Also record every sample (with temperature) to HDF5
+  -d, --duration <SECS>    Stop after this long (default: until Enter or Ctrl+C)
 
   cargo run
   cargo run --features analysis
   cargo run --features analysis -- --odr 2000
+  cargo run --features analysis -- --range 8 --output drive.h5
 
 
 2. collector
@@ -27,19 +31,25 @@ Record sensor data to HDF5 file.
 Options:
   -m, --mode <MODE>        "polling" or "fifo" (default: polling)
   -r, --rate <RATE>        Sample rate in Hz (default: 100)
-  -d, --duration <SECS>    Recording length (default: until Ctrl+C)
+  -d, --duration <SECS>    Recording length (default: until Enter or Ctrl+C)
   -o, --output <FILE>      Output path (default: sensor_data.h5)
+      --range <G>          Measurement range 2, 4 or 8 g (default: 2). Noise density
+                           rises only from 22.5 to 25 ug/rtHz at 8 g
 
 FIFO mode is faster and more reliable than polling for high rates.
 FIFO: rate maps to nearest ODR preset: 4000, 2000, 1000, 500, 250, 125, 62.5, 31.25 Hz
 Polling: ODR is the next preset above the rate (e.g. 100 -> 125, 180 -> 250), so no
 sample is read twice. FIFO overflows are reported at the end of collection.
+FIFO mode also stores the sensor temperature (read once per second) and shows it
+on the progress line. The file records metadata/timestamps_origin, the wall-clock
+time of timestamps = 0.
 
 Examples:
   cargo run --bin collector -- --mode fifo --rate 1000 --duration 10
   cargo run --bin collector -- --mode fifo --rate 4000 --duration 30 --output fast.h5
+  cargo run --bin collector -- --mode fifo --rate 4000 --range 8 --duration 60
   cargo run --bin collector -- --mode polling --rate 100 --duration 60
-  cargo run --bin collector -- --mode fifo --rate 1000           # runs until Ctrl+C
+  cargo run --bin collector -- --mode fifo --rate 1000           # runs until Enter
 
 
 3. analyzer
@@ -86,3 +96,64 @@ split Write+Read; checks no stray bytes are left in the FTDI RX queue.
 Minimal raw SPI read (DEVID_AD register) with inline FFI.
 
   cargo run --bin spi-raw-test
+
+
+7. scripts (PowerShell, release build)
+--------------------------------------
+Fixed settings for vibration recording. Build once first:
+  cargo build --release --features analysis
+
+record.ps1: FIFO, 4 kHz ODR, +/-8 g, then prints a quick check (range, measured
+sample rate, missing-sample warning, clipped samples, per-axis statistics and
+vibration values, engine rpm and order levels per steady segment of 5 s or more).
+Files go to <OutDir>\<yyMMdd-HHmmss>_<Name>.h5, OutDir defaults to measurements\<yyMMdd>
+(the whole measurements folder is gitignored).
+Names use letters, digits and hyphens only. Without -Seconds it runs until Enter.
+-Live records with the live display instead; -Cylinders sets the engine (default 4).
+
+  .\scripts\record.ps1 -Name idle-r1 -Seconds 60
+  .\scripts\record.ps1 -Name start-auto
+  .\scripts\record.ps1 -Name bench -Seconds 60 -OutDir D:\data\bench -Range 2
+
+finish.ps1: writes <file>_report.txt (analyzer --all) for every .h5 in OutDir,
+engine metrics for all files to metrics.csv, and SHA-256 hashes of the raw files
+to sha256.csv.
+
+  .\scripts\finish.ps1
+  .\scripts\finish.ps1 -OutDir .\measurements\261018 -Cylinders 4
+
+
+8. engine-metrics
+-----------------
+Engine vibration metrics with the engine speed taken from the vibration itself
+(firing-order frequency). One CSV row per steady segment (order levels, band
+levels, overall values, crest factor, kurtosis, attitude, temperature) and per
+deceleration segment (rpm/s). Definitions: METRICS.md. Requires --features analysis.
+
+Options:
+  -o, --output <FILE>      CSV output (default: print a summary only)
+      --cylinders <N>      4-stroke cylinders, firing order = N/2 (default: 4)
+      --steady-min <SECS>  Minimum steady segment (default: 10)
+      --decel-hi <RPM>     Deceleration segment start (default: 2500)
+      --decel-lo <RPM>     Deceleration segment end (default: 1500)
+      --gate <G>           Engine-running threshold, 20-200 Hz RMS (default: 0.02)
+
+  cargo run --release --features analysis --bin engine-metrics -- a.h5 b.h5 -o metrics.csv
+
+
+9. metrics-compare
+------------------
+Before/after comparison of engine-metrics CSVs. Each CSV is one session; sessions
+are averaged first, then the change is checked against the minimum detectable
+change (MDC). Amplitudes are also reported scaled to a common rpm (<column>@rpm).
+
+Options:
+      --before <CSV>...    Sessions before the change (at least 2 for an MDC)
+      --after <CSV>...     Sessions after the change
+      --kind <KIND>        steady or decel (default: steady)
+      --rpm-min/--rpm-max  Only steady segments in this rpm range
+      --rpm-exp <X>        Scaling exponent for @rpm columns (default: 2)
+  -o, --output <FILE>      Also write the table as CSV
+
+  cargo run --release --features analysis --bin metrics-compare -- --before d1/metrics.csv d2/metrics.csv --after d3/metrics.csv d4/metrics.csv --rpm-min 600 --rpm-max 900
+  cargo run --release --features analysis --bin metrics-compare -- --kind decel --before ... --after ...

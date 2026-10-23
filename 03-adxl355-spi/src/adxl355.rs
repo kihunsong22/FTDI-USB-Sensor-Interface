@@ -56,6 +56,25 @@ pub enum Range {
 }
 
 impl Range {
+    /// Range for a full scale of 2, 4 or 8 g
+    pub fn from_g(g: u32) -> Option<Self> {
+        match g {
+            2 => Some(Range::G2),
+            4 => Some(Range::G4),
+            8 => Some(Range::G8),
+            _ => None,
+        }
+    }
+
+    /// Nominal full scale in g
+    pub fn full_scale_g(&self) -> f32 {
+        match self {
+            Range::G2 => 2.0,
+            Range::G4 => 4.0,
+            Range::G8 => 8.0,
+        }
+    }
+
     pub fn scale_factor(&self) -> f32 {
         match self {
             Range::G2 => 256_000.0,

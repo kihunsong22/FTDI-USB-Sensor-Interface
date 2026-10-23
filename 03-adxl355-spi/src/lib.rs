@@ -10,10 +10,12 @@ pub mod hdf5_format;
 pub mod common;
 #[cfg(feature = "analysis")]
 pub mod analysis;
+#[cfg(feature = "analysis")]
+pub mod engine_metrics;
 
 pub use error::{Adxl355Error, Result};
 pub use adxl355::{Adxl355, SensorData, StreamControl, Range, OutputDataRate, FifoBatchResult};
 pub use hdf5_format::{Hdf5Reader, Hdf5Writer, Metadata, TimestampedSample};
-pub use common::{TimeKeeper, create_bar};
+pub use common::{TimeKeeper, create_bar, prioritize_polling};
 #[cfg(feature = "analysis")]
 pub use analysis::{compute_rms, find_frequency_peaks, FrequencyPeak};
