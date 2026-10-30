@@ -1,0 +1,5 @@
+# Library paths are handled by build.rs
+
+[build]
+# Target Windows x64 (64-bit) to match the available DLLs
+target = "x86_64-pc-windows-msvc"

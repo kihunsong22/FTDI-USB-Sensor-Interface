@@ -1,0 +1,11 @@
+[package]
+name = "ft232-lsm6dsox-i2c"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "lsm6dsox"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
